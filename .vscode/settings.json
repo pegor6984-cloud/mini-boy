@@ -1,0 +1,9 @@
+{
+    "files.exclude": {
+        "**/.pio": true,
+        "**/__pycache__": true,
+        "**/*.pyc": true
+    },
+    "platformio-ide.projectDir": "firmware",
+    "python.analysis.extraPaths": ["${workspaceFolder}/server"]
+}

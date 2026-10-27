@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+venv/
+.env
+*.db
+*.sqlite
+*.sqlite3
+.pio/
+builds/
+build_logs/
+build_state.json
+*.bin
+apps/
+.DS_Store
+Thumbs.db
+*.swp
