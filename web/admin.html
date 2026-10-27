@@ -1,0 +1,94 @@
+﻿<!doctype html><html lang="ru"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Admin — MINI-BOY Store</title>
+<link rel="stylesheet" href="/static/style.css">
+</head><body>
+<div class="container">
+<div class="topbar"><a href="/" class="btn ghost">← На главную</a></div>
+<h1>📤 Публикация</h1>
+<p class="lead">Можно загрузить готовый файл .mbg или вставить JSON-код прямо в текстовое поле.</p>
+
+<div class="card">
+  <h2>🎮 Приложение из файла</h2>
+  <p class="muted">Загрузи готовый .mbg (JSON-файл для встроенного движка).</p>
+  <form id="f1" enctype="multipart/form-data">
+    <label class="field">Пароль администратора</label>
+    <input name="password" type="password" required>
+    <label class="field">Файл .mbg</label>
+    <input name="mbg" type="file" accept=".mbg,.json" required>
+    <button class="btn primary" style="margin-top:12px">📤 Опубликовать</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>💻 Приложение из кода</h2>
+  <p class="muted">Вставь JSON-код приложения прямо сюда. Удобно, если создаёшь на телефоне или планшете.</p>
+  <form id="f2">
+    <label class="field">Пароль администратора</label>
+    <input name="password" type="password" required>
+    <label class="field">JSON-код приложения</label>
+    <textarea name="code" rows="16" placeholder='{"format":"mbg-1","name":"My App","engine":"app",...}' required style="font-family:Consolas,monospace;font-size:12px"></textarea>
+    <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
+      <button class="btn primary" type="submit">📤 Опубликовать из кода</button>
+      <button class="btn ghost" type="button" onclick="fillExample()">✨ Пример</button>
+      <button class="btn ghost" type="button" onclick="formatJson()">📐 Форматировать</button>
+    </div>
+  </form>
+</div>
+
+<pre id="out" class="log"></pre>
+</div>
+
+<script>
+async function submit(fd, url) {
+  const out = document.getElementById('out');
+  out.classList.add('show');
+  out.textContent = '⏳ Отправка...';
+  try {
+    const r = await fetch(url, { method: 'POST', body: fd });
+    const t = await r.text();
+    out.innerHTML = r.ok ? '<span style="color:#6de5c1">✅ ' + t + '</span>' : '<span style="color:#ff8192">❌ ' + t + '</span>';
+  } catch(e) {
+    out.innerHTML = '<span style="color:#ff8192">❌ ' + e.message + '</span>';
+  }
+}
+document.getElementById('f1').onsubmit = e => { e.preventDefault(); submit(new FormData(e.target), '/api/admin/publish'); };
+document.getElementById('f2').onsubmit = e => { e.preventDefault(); submit(new FormData(e.target), '/api/admin/publish_text'); };
+
+function fillExample() {
+  const ex = {
+    "format":"mbg-1",
+    "name":"Counter",
+    "author":"you",
+    "version":"1.0.0",
+    "engine":"app",
+    "description":"Простой счётчик",
+    "tags":["util"],
+    "icon":[["box",-6,-6,12,12],["line",-3,0,3,0],["line",0,-3,0,3]],
+    "params":{
+      "title":"Counter",
+      "vars":{"n":0},
+      "display":"n",
+      "buttons":[
+        {"x":2,"y":40,"w":30,"h":20,"label":"-1","act":"add","var":"n","val":-1},
+        {"x":34,"y":40,"w":30,"h":20,"label":"+1","act":"add","var":"n","val":1},
+        {"x":66,"y":40,"w":30,"h":20,"label":"x2","act":"mul","var":"n","val":2},
+        {"x":98,"y":40,"w":30,"h":20,"label":"RST","act":"set","var":"n","val":0}
+      ]
+    },
+    "music":[]
+  };
+  document.querySelector('textarea[name="code"]').value = JSON.stringify(ex, null, 2);
+}
+
+function formatJson() {
+  const ta = document.querySelector('textarea[name="code"]');
+  try {
+    const obj = JSON.parse(ta.value);
+    ta.value = JSON.stringify(obj, null, 2);
+  } catch(e) {
+    alert('Невалидный JSON: ' + e.message);
+  }
+}
+</script>
+</body></html>

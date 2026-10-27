@@ -1,0 +1,41 @@
+﻿<!doctype html>
+<html lang="ru"><head>
+<meta charset="utf-8"><title>{{ app.name }} — MINI-BOY Store</title>
+<link rel="stylesheet" href="/static/style.css">
+</head><body>
+<a href="/" class="back">← назад</a>
+<div class="app-page">
+  <div class="preview-large">
+    {% if app.screenshot_b64 %}
+    <img src="data:image/png;base64,{{ app.screenshot_b64 }}" alt="">
+    {% endif %}
+  </div>
+  <h1>{{ app.name }}</h1>
+  <p class="meta"><b>{{ app.author }}</b> · v{{ app.version }} · engine: {{ app.engine }} · {{ (app.size/1024)|round(1) }} KB · скачиваний: {{ app.downloads }}</p>
+  <p class="desc">{{ app.description }}</p>
+  <div class="tags">{% for t in app.tags.split(',') if t %}<span>{{ t }}</span>{% endfor %}</div>
+  <div class="actions">
+    <a class="btn primary" href="/download/{{ app.slug }}.mbg">Скачать .mbg</a>
+    <button class="btn" onclick="installToDevice('{{ app.slug }}')">Установить на MINI-BOY</button>
+  </div>
+
+  <h2>Исходник (JSON)</h2>
+  <pre>{{ source }}</pre>
+</div>
+<div id="status" class="status"></div>
+<script>
+async function installToDevice(slug) {
+  let ip = prompt("IP MINI-BOY:", localStorage.getItem("mbIp") || "");
+  if (!ip) return;
+  localStorage.setItem("mbIp", ip);
+  let r = await fetch(`/download/${slug}.mbg`);
+  let text = await r.text();
+  try {
+    let resp = await fetch(`http://${ip}/api/apps/install`, { method: "POST", body: text });
+    document.getElementById("status").textContent = "✅ " + await resp.text();
+  } catch(e) {
+    document.getElementById("status").textContent = "❌ " + e.message;
+  }
+}
+</script>
+</body></html>
