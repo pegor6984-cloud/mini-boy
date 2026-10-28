@@ -1,0 +1,14 @@
+CompileFlags:
+  CompilationDatabase: ./
+  Compiler: D:/pio-core/packages/toolchain-riscv32-esp/bin/riscv32-esp-elf-g++.exe
+  Add:
+    - -w
+    - -isystemD:/pio-core/packages/toolchain-riscv32-esp/riscv32-esp-elf/include
+    - -isystemD:/pio-core/packages/toolchain-riscv32-esp/riscv32-esp-elf/include/c++/14.2.0
+    - -isystemD:/pio-core/packages/toolchain-riscv32-esp/riscv32-esp-elf/include/c++/14.2.0/riscv32-esp-elf/rv32imc_zicsr_zifencei/ilp32
+    - -isystemD:/pio-core/packages/toolchain-riscv32-esp/riscv32-esp-elf/include/c++/14.2.0/backward
+
+Diagnostics:
+  Suppress: [clang, clang-tidy]
+  ClangTidy:
+    Remove: [ "*" ]
