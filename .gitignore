@@ -1,11 +1,21 @@
-﻿# Игнорируем системный мусор и секреты
-server/sketch_src/
-__pycache__/
-*.pyc
+# ======= ИГНОРИРУЕМ СЕРВЕРНУЮ ЧАСТЬ (Код и БД) =======
+server/
+
+# ======= ИГНОРИРУЕМ СЕКРЕТЫ И КЛЮЧИ =======
 .env
 config_secret.h
+config_generated.h
 
-# Игнорируем базу данных и логи (они должны создаваться заново на сервере)
-server/store.db
-server/build_logs/
-server/builds/
+# ======= ИГНОРИРУЕМ МУСОР PYTHON =======
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# ======= БАЗЫ ДАННЫХ =======
+*.db
+*.sqlite3
+
+# ======= МУСОР PLATFORMIO =======
+.pio/

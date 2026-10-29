@@ -1,18 +1,11 @@
-﻿# Работа с веб-сайтом MINI-BOY
+﻿# MINI-BOY Web Panel
 
-## Запуск сервера
-1. Перейдите в папку `python/mini-store`.
-2. Активируйте виртуальное окружение (если есть).
-3. Выполните: `python server.py`.
-4. Откройте в браузере: `http://localhost:8000`.
+## Starting the Server
+1. Open the \server\ folder in your terminal.
+2. Run: \python server.py\.
+3. Navigate to: \http://localhost:8000\.
 
-## Публикация приложений
-- Перейдите в `/admin`.
-- Введите пароль администратора.
-- Загрузите `.mbg` файл или вставьте JSON вручную.
-
-## Сборка прошивки через веб-интерфейс
-- Перейдите в `/builder`.
-- Выберите нужные модули.
-- Нажмите «Собрать» и дождитесь окончания.
-- Готовый `.bin` файл можно скачать и прошить.
+## Publishing Games
+1. Go to the \/admin\ page.
+2. Enter the admin password (default: 123 - *change it in server.py!*).
+3. Upload a \.mbg\ file or paste JSON code manually.

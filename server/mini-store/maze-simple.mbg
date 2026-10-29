@@ -1,1 +1,0 @@
-{"format":"mbg-1","name":"Breakout Tough","author":"you","version":"1.0.0","engine":"breakout","description":"All bricks are 3 HP.","tags":["breakout","hard"],"params":{"bricks_hp":3,"ball_speed":2.5,"paddle_width":18,"rows":6},"music":[]}

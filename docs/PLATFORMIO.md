@@ -1,19 +1,11 @@
-﻿# MINI-BOY — сборка и прошивка
+﻿# PlatformIO Setup
 
-## Требования
-- VS Code
-- Расширение PlatformIO IDE
-- Python 3.8+
+## Build and Flash
+1. Open the \irmware\ folder in VS Code.
+2. Click the checkmark (Build) on the bottom panel to compile.
+3. Click the arrow (Upload) to flash the board.
 
-## Установка
-1. Откройте папку `firmware` в VS Code.
-2. Дождитесь, пока PlatformIO установит все зависимости.
-3. Подключите плату ESP32C3 по USB.
-
-## Сборка и прошивка
-- Нажмите иконку **галочки** на нижней панели — сборка.
-- Нажмите иконку **стрелки вправо** — прошивка.
-- Или выполните в терминале: `pio run -t upload`.
-
-## Примечание
-Если сборка падает с ошибкой `No space left on device`, перенесите папку `.platformio` на другой диск, установив переменную окружения `PLATFORMIO_CORE_DIR`.
+## Troubleshooting (No space left on device)
+If the build fails with 'No space left on device', move PlatformIO core to another drive by running this in PowerShell:
+\[Environment]::SetEnvironmentVariable("PLATFORMIO_CORE_DIR", "D:\pio-core", "User")\
+Then restart VS Code.

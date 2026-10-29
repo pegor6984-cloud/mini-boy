@@ -179,7 +179,7 @@ size_t webUploadBytes = 0;
 String webUploadDest;
 static const char* AP_NAME = "MINI-BOY-FILES";
 static const char* PANEL_HOST = "miniboy"; // open http://miniboy.local when mDNS is supported
-static const char* AP_PASS = "YOUR_AP_PASSWORD"; // Change before using outside a trusted environment.
+static const char* AP_PASS = "123"; // Change before using outside a trusted environment.
 bool otaInProgress = false;
 #define FIRMWARE_VERSION "5.1.0"
 
@@ -1047,7 +1047,7 @@ int mapAxis(int val, int center, int minVal, int maxVal) {
 
 void sendHeartbeat() {
   if (WiFi.status() != WL_CONNECTED) return;
-  String storeUrl = prefs.getString("store_url", "http://192.168.178.22:8000");
+  String storeUrl = prefs.getString("store_url", "http://monoxide-divinity-dividable.ngrok-free.dev");
   if (!storeUrl.length()) return;
 
   String host; int port = 80;
@@ -2589,10 +2589,10 @@ void runFactoryReset() {
 }
 
 void editStoreUrl() {
-  String url = prefs.getString("store_url", "http://192.168.178.22:8000");
+  String url = prefs.getString("store_url", "http://monoxide-divinity-dividable.ngrok-free.dev");
 
   // Значение по умолчанию — подставь IP компьютера, если не задано
-  if (!url.length()) url = "http://192.168.178.22:8000";
+  if (!url.length()) url = "http://monoxide-divinity-dividable.ngrok-free.dev";
 
   if (!runKeyboard("Store URL", url, false)) return;
 

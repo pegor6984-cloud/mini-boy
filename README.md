@@ -1,59 +1,59 @@
-# 🎮 MINI-BOY — Портативная консоль на ESP32-C3
+# 🎮 MINI-BOY — Portable ESP32-C3 Console
 
-Добро пожаловать в репозиторий **MINI-BOY** — кастомной карманной консоли, собранной на базе микроконтроллера ESP32-C3. Проект объединяет в себе ретро-игры, умную экосистему и возможности интернета вещей.
+Welcome to the **MINI-BOY** repository — a custom handheld console built on the ESP32-C3 microcontroller. This project combines retro gaming, a smart ecosystem, and IoT capabilities.
 
-## ✨ Что умеет консоль?
+## ✨ Features
 
-*   **🕹️ 20+ встроенных игр:** от классики (Змейка, Тетрис, Арканоид) до авторских проектов (Super Mario, Танчики).
-*   **📺 OLED-дисплей 128x64:** отрисовка интерфейса и графики благодаря библиотеке U8g2.
-*   **💾 Работа с SD-картой:** загрузка динамических приложений (.mbg), сохранение заметок, смена заставки и обновление прошивки прямо с карты памяти.
-*   **🌐 Web-панель управления:** доступ к файловой системе консоли и управление через браузер смартфона (по Wi-Fi).
-*   **🤖 Нейросети (Gemini AI):** возможность задать вопрос искусственному интеллекту прямо с экрана консоли.
-*   **🔋 Энергонезависимая память:** сохранение рекордов, настроек звука и калибровки кнопок.
+*   **🕹️ 20+ Built-in Games:** from classics (Snake, Tetris, Breakout) to custom projects (Super Mario, Tanks).
+*   **📺 128x64 OLED Display:** smooth graphics powered by the U8g2 library.
+*   **💾 SD Card Support:** load dynamic apps (.mbg), save notes, change boot logos, and update firmware directly from the SD card.
+*   **🌐 Web Panel:** access the console's file system and manage it via a smartphone browser (over Wi-Fi).
+*   **🤖 AI Integration (Gemini):** ask artificial intelligence questions right from the console screen.
+*   **🔋 Non-Volatile Memory:** saves high scores, sound settings, and button calibration.
 
-## 🛠️ Аппаратная часть
-*   Микроконтроллер **ESP32-C3**
-*   Экран **SSD1306** (I2C, 128x64)
-*   Модуль **SD-карты** (SPI)
-*   Пьезо-пищалка (зуммер) для 8-битной музыки и звуков
-*   6 тактильных кнопок (Вверх, Вниз, Влево, Вправо, ОК, Назад)
+## 🛠️ Hardware Requirements
+*   **ESP32-C3** microcontroller
+*   **SSD1306** display (I2C, 128x64)
+*   **SD Card module** (SPI)
+*   Piezo buzzer (for 8-bit music and sound effects)
+*   6 tactile buttons (Up, Down, Left, Right, OK, Back)
 
-## 🚀 Быстрый старт (Прошивка)
+## 🚀 Quick Start (Flashing)
 
-1.  Установите **VS Code** и расширение **PlatformIO IDE**.
-2.  Откройте папку irmware в VS Code.
-3.  Подключите ESP32-C3 по USB.
-4.  Для сборки и загрузки нажмите иконку **➡️ (Upload)** на нижней панели PlatformIO.
-5.  Готово! Консоль перезагрузится и запустит главное меню.
+1. Install **VS Code** and the **PlatformIO IDE** extension.
+2. Open the irmware folder in VS Code.
+3. Connect the ESP32-C3 via USB.
+4. Press the **➡️ (Upload)** icon on the bottom PlatformIO panel to build and flash.
+5. Done! The console will reboot and launch the main menu.
 
-> 💡 **Примечание:** Если вы впервые шьете плату, не забудьте вставить свой GEMINI_API_KEY в файле main.cpp (или config_generated.h).
+> 💡 **Note:** If you are flashing the board for the first time, don't forget to insert your GEMINI_API_KEY in main.cpp (or config_generated.h).
 
-## 🌍 Серверная часть (MINI-BOY Store)
+## 🌍 Server Side (MINI-BOY Store)
 
-В проекте реализован локальный Python-сервер (FastAPI), который позволяет публиковать игры, собирать прошивки и управлять устройствами.
+The project includes a local Python server (FastAPI) that allows you to publish games, build firmware, and manage devices.
 
-### Запуск сервера:
+### Starting the server:
 \\\ash
 cd server
 pip install -r requirements.txt
 python server.py
 \\\
-После запуска сервер будет доступен по адресу: \http://localhost:8000\
+Once running, the server will be available at: \http://localhost:8000\
 
-### Доступ из любой точки мира:
-Чтобы открыть панель управления с мобильного интернета, используйте туннель **ngrok**:
+### Global Access:
+To access the control panel from mobile internet, use the **ngrok** tunnel:
 \\\ash
 ngrok http 8000
 \\\
-Скопируйте полученную ссылку (например, \https://xxxx.ngrok-free.app\) и укажите её в настройках вашей консоли (Store URL).
+Copy the generated URL (e.g., \https://xxxx.ngrok-free.app\) and specify it in your console settings (Store URL). *Note: use http:// instead of https:// for the ESP32 client.*
 
-## 📂 Структура проекта
-*   \irmware/\ — Исходный код прошивки для PlatformIO (C++).
-*   \server/\ — Код сервера на Python (FastAPI) и база данных магазина.
-*   \docs/\ — Дополнительные инструкции и документация.
+## 📂 Project Structure
+*   \irmware/\ — PlatformIO firmware source code (C++).
+*   \server/\ — Python FastAPI server and store database.
+*   \docs/\ — Additional instructions and documentation.
 
-## 📜 Лицензия
-Этот проект распространяется под лицензией MIT. Вы можете свободно изменять, дополнять и использовать код для своих собственных устройств!
+## 📜 License
+This project is distributed under the MIT License. You are free to modify, extend, and use the code for your own devices!
 
 ---
-*Создано с любовью к ретро-играм и микроконтроллерам.* ❤️
+*Created with love for retro games and microcontrollers.* ❤️
