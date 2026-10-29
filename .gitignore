@@ -4,3 +4,8 @@ __pycache__/
 *.pyc
 .env
 config_secret.h
+
+# Игнорируем базу данных и логи (они должны создаваться заново на сервере)
+server/store.db
+server/build_logs/
+server/builds/
