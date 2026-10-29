@@ -1,0 +1,1 @@
+{"format":"mbg-1","name":"Speed Pong","author":"you","version":"1.0.0","engine":"pong","description":"Fast ball, strong AI, 10 points to win.","tags":["pong","fast"],"params":{"ball_speed":3.5,"ai_speed":3.0,"win_score":10},"music":[]}

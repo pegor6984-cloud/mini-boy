@@ -1,0 +1,6 @@
+=== Build started: my-build-1 at 2026-10-27 00:28:12.088900 ===
+[1/4] Копирую файлы из C:\Users\Pc\Documents\Arduino\python\mini-store\sketch_src → D:\Temp\mb_pnj54tfe\MINI_BOY
+[2/4] Переименовываю .ino → MINI_BOY.ino
+[3/4] Генерирую config_generated.h
+[4/4] Запускаю: arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=min_spiffs --output-dir D:\Temp\mb_pnj54tfe\out D:\Temp\mb_pnj54tfe\MINI_BOY
+

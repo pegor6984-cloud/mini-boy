@@ -1,0 +1,1 @@
+{"format":"mbg-1","name":"Flappy Easy","author":"you","version":"1.0.0","engine":"flappy","description":"Wide gaps for beginners.","tags":["flappy","easy"],"params":{"gravity":0.18,"flap":-2.5,"gap":38,"speed":1.0},"music":[]}

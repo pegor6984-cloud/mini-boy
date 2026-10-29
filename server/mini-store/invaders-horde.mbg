@@ -1,0 +1,1 @@
+{"format":"mbg-1","name":"Moon Jump","author":"you","version":"1.0.0","engine":"jumper","description":"Low gravity, easy platforms.","tags":["jumper","easy"],"params":{"gravity":0.15,"jump":-4.5,"platforms":6},"music":[]}

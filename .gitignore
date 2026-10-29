@@ -1,16 +1,6 @@
+﻿# Игнорируем системный мусор и секреты
+server/sketch_src/
 __pycache__/
-*.py[cod]
-venv/
+*.pyc
 .env
-*.db
-*.sqlite
-*.sqlite3
-.pio/
-builds/
-build_logs/
-build_state.json
-*.bin
-apps/
-.DS_Store
-Thumbs.db
-*.swp
+config_secret.h
