@@ -152,6 +152,7 @@ void runAppOptions(int id);
 void runFmSettings();
 void present();
 void showScreen(const char* title, const String& a, const String& b = "", const String& c = "");
+const char* appName(int id); 
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE);
 Preferences prefs;
 
