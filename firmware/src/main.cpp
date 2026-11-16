@@ -1,12 +1,3 @@
-// ║    ███╗   ███╗██╗███╗   ██╗██╗    ██████╗  ██████╗ ██╗   ██╗   ║
-// ║    ████╗ ████║██║████╗  ██║██║    ██╔══██╗██╔═══██╗╚██╗ ██╔╝   ║
-// ║    ██╔████╔██║██║██╔██╗ ██║██║    ██████╔╝██║   ██║ ╚████╔╝    ║
-// ║    ██║╚██╔╝██║██║██║╚██╗██║██║    ██╔══██╗██║   ██║  ╚██╔╝     ║
-// ║    ██║ ╚═╝ ██║██║██║ ╚████║██║    ██████╔╝╚██████╔╝   ██║      ║
-// ║    ╚═╝     ╚═╝╚═╝╚═╝  ╚═══╝╚═╝    ╚═════╝  ╚═════╝    ╚═╝      ║
-// ⚠️ ВАЖНО: перед сборкой замени GEMINI_API_KEY на свой.
-// Получить: https://aistudio.google.com/apikey
-#include <Arduino.h>
 #include <math.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -15,6 +6,8 @@
 #include <Wire.h>
 #include <U8g2lib.h>
 #include <Preferences.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <SPI.h>
 #include <SD.h>
 #include <WebServer.h>
@@ -100,11 +93,12 @@ const char* API_URL = "https://generativelanguage.googleapis.com/v1beta/models/g
 
 // Add File Manager as the 25th main-menu app without changing existing app IDs.
 #define APP_FILE_MANAGER APP_COUNT
-int menuAppCount = APP_COUNT + 1; // Динамический счетчик
+int menuAppCount = APP_COUNT + 1;
+uint8_t appOrder[APP_COUNT + 1]; // Динамический счетчик
 
 uint8_t BTN_PIN[BI_COUNT] = {5, 7, 3, 1, 2, 6};
 const int REC_N = 23;
-const int SET_N = 35;
+const int SET_N = 43;
 // === Заводские GPIO для кнопок ===
 const uint8_t DEFAULT_BTN_GPIO[BI_COUNT] = {5, 7, 3, 1, 2, 6};
 // Порядок: BI_UP=0, BI_DOWN=1, BI_LEFT=2, BI_RIGHT=3, BI_OK=4, BI_BACK=5
@@ -132,6 +126,7 @@ void resetScores();
 void showSystemInfo();
 void showAbout();
 void scanMbApps();
+void scanLoadedLangs();
 String chooseSdFile();
 void waitAnyKey();
 void runSdFirmwareUpdate();
@@ -147,14 +142,37 @@ void runDynGemini(JsonDocument& doc);
 void runNotes();
 void showGameDocs(int id);
 void runSettings();
+void runLockScreen();
+void runLockSettings();
+void saveSettingsToSD();
+void runAppOrderEditor();
+void runStoreCatalog();
+void loadSettingsFromSD();
+bool confirmBox(const char* title, const char* a, const char* b);
+bool g_pinEnabled = false;
+String g_pinCode = "";
+String g_pinBuffer = "";
+void showProcessMonitor();
 void runLocalFileManager();
 void runAppOptions(int id);
 void runFmSettings();
 void present();
+const char* appName(int id);
 void showScreen(const char* title, const String& a, const String& b = "", const String& c = "");
-const char* appName(int id); 
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE);
+
+// German uses extended Latin glyphs (Ä Ö Ü ä ö ü ß); RU/UA keep Cyrillic fonts.
+const uint8_t* uiFontLarge() {
+  return cfg.lang == 3 ? u8g2_font_helvR08_te : u8g2_font_6x13_t_cyrillic;
+}
+const uint8_t* uiFontSmall() {
+  return cfg.lang == 3 ? u8g2_font_tom_thumb_4x6_te : u8g2_font_5x8_t_cyrillic;
+}
 Preferences prefs;
+TaskHandle_t heartbeatTaskHandle = nullptr;
+const uint8_t* uiFontLarge();
+const uint8_t* uiFontSmall();
+void startHeartbeatTask();
 
 // ================= SD FILE MANAGER + PHONE WEB PANEL =================
 // Pin mapping candidate: CS=4, SCK=0, MOSI=20, MISO=21. Confirm board pinout
@@ -179,9 +197,9 @@ size_t webUploadBytes = 0;
 String webUploadDest;
 static const char* AP_NAME = "MINI-BOY-FILES";
 static const char* PANEL_HOST = "miniboy"; // open http://miniboy.local when mDNS is supported
-static const char* AP_PASS = "123"; // Change before using outside a trusted environment.
+static const char* AP_PASS = "miniboy8g"; // Change before using outside a trusted environment.
 bool otaInProgress = false;
-#define FIRMWARE_VERSION "5.1.0"
+#define FIRMWARE_VERSION "8.8.5"
 
 String htmlEscape(const String &s) {
   String o; o.reserve(s.length()+8);
@@ -260,6 +278,9 @@ const char* moduleIdForApp(int appId) {
     default: return nullptr;
   }
 }
+uint32_t lastHbTime = 0;
+String lastHbResult = "never";
+
 void setupFileWeb() {
   sdSPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
   sdReady=SD.begin(SD_CS_PIN,sdSPI,10000000);
@@ -595,17 +616,10 @@ fileWeb.on("/api/apps/delete", HTTP_GET, [](){
   }
 });
 fileWeb.on("/api/apps/all", HTTP_GET, [](){
-  static String cache = "";
-  static uint32_t lastUpdate = 0;
-  
-  if (millis() - lastUpdate < 3000 && cache.length() > 0) {
-    fileWeb.sendHeader("Access-Control-Allow-Origin", "*");
-    fileWeb.send(200, "application/json", cache);
-    return;
-  }
+  static String cachedSdJson = "";
+  static uint32_t lastSdScan = 0;
   
   fileWeb.sendHeader("Access-Control-Allow-Origin", "*");
-  
   JsonDocument modulesDoc;
   deserializeJson(modulesDoc, FIRMWARE_MODULES_JSON);
   
@@ -627,35 +641,40 @@ fileWeb.on("/api/apps/all", HTTP_GET, [](){
     nm.replace("\"", "\\\"");
     out += "{\"id\":" + String(i) + ",\"module\":\"" + mid + "\",\"name\":\"" + nm + "\",\"enabled\":" + (en?"true":"false") + "}";
   }
-  out += "],\"sd\":[";
-  first = true;
-  if (sdReady) {
-    File dir = SD.open("/apps");
-    if (dir) {
-      File f = dir.openNextFile();
-      while (f) {
-        String nm = String(f.name());
-        String low = nm; low.toLowerCase();
-        if (!f.isDirectory() && low.endsWith(".mbg")) {
-          if (!first) out += ",";
-          first = false;
-          out += "{\"name\":\"" + nm + "\",\"size\":" + String(f.size()) + "}";
-        }
-        f.close();
-        f = dir.openNextFile();
-      }
-      if (f) f.close();
-      dir.close();
-    }
-  }
-  out += "],";
-  out += "\"sd_ready\":" + String(sdReady ? "true" : "false");
-  out += "}";
+  out += "],\"sd\":";
   
-  cache = out;
-  lastUpdate = millis();
+  // Кэшируем на 5 секунд чтобы не тормозить SD на каждом запросе
+  if (millis() - lastSdScan > 5000) {
+    lastSdScan = millis();
+    cachedSdJson = "[";
+    bool f2 = true;
+    if (sdReady) {
+      File dir = SD.open("/apps");
+      if (dir) {
+        File f = dir.openNextFile();
+        while (f) {
+          String nm = String(f.name());
+          String low = nm; low.toLowerCase();
+          if (!f.isDirectory() && low.endsWith(".mbg")) {
+            if (!f2) cachedSdJson += ",";
+            f2 = false;
+            cachedSdJson += "{\"name\":\"" + nm + "\",\"size\":" + String(f.size()) + "}";
+          }
+          f.close();
+          f = dir.openNextFile();
+        }
+        if (f) f.close();
+        dir.close();
+      }
+    }
+    cachedSdJson += "]";
+  }
+  out += cachedSdJson;
+  out += ",\"sd_ready\":" + String(sdReady ? "true" : "false");
+  out += "}";
   fileWeb.send(200, "application/json", out);
 });
+  fileWeb.on("/api/debug", HTTP_GET, [](){ String j="{"; j+="\"wifi\":"; j+=(WiFi.status()==WL_CONNECTED?"true":"false"); j+=",\"ip\":\""+WiFi.localIP().toString()+"\","; j+="\"store_url\":\""+prefs.getString("store_url","")+"\","; j+="\"last_hb_ms\":"+String(lastHbTime)+","; j+="\"last_hb_ago_s\":"+String(lastHbTime?((millis()-lastHbTime)/1000):99999)+","; j+="\"last_hb_result\":\""+lastHbResult+"\","; j+="\"uptime_s\":"+String(millis()/1000); j+="}"; fileWeb.send(200,"application/json",j); });
   fileWeb.begin();
 }
 void serviceFileWeb(){ captiveDns.processNextRequest(); fileWeb.handleClient(); }
@@ -804,11 +823,27 @@ const char* appName(int id) {
     "Танки", "Лови зірки", "Реакція", "Лабіринт", "Стрибун", "Super Mario",
     "Нотатки", "Налаштування"
   };
+  static const char* namesDE[APP_COUNT] = {
+    "Dino Lauf","Flappy","Tetris","Schlange","Pong","Arkanoid",
+    "Invaders","Asteroiden","Minen","2048","Simon","Frosch",
+    "Tic-Tac-Toe","Gemini","Labyrinth-Schlange","Memory","Skater",
+    "Panzer","Sterne fangen","Reaktion","Labyrinth","Springer",
+    "Super Mario","Notizen","Einstellungen"
+  };
+  static const char* namesFR[APP_COUNT] = {
+    "Dino Course","Flappy","Tetris","Serpent","Pong","Casse-briques",
+    "Envahisseurs","Asteroides","Demineur","2048","Simon","Grenouille",
+    "Morpion","Gemini","Serpent Labyrinthe","Memory","Skateur",
+    "Tank","Etoiles","Reaction","Labyrinthe","Sauteur",
+    "Super Mario","Notes","Parametres"
+  };
   
   if (id < 0 || id >= APP_COUNT) return "?";
   const char* result;
   if (cfg.lang == 1) result = namesRU[id];
   else if (cfg.lang == 2) result = namesUA[id];
+  else if (cfg.lang == 3) result = namesDE[id];
+  else if (cfg.lang == 4) result = namesFR[id];
   else result = namesEN[id];
   return result ? result : "?";
 }
@@ -837,8 +872,8 @@ const char* GAME_DOCS_EN[APP_COUNT] = {
   "LABYRINTH: Find the exit. New random maze each level. Arrows move.",
   "JUMPER: Climb platforms upward. Move LEFT/RIGHT. Camera follows you.",
   "SUPER MARIO: Four platform levels, enemies, coins, stars and a boss. LEFT/RIGHT move, UP/OK jump.",
-  "SETTINGS: Configure device. Wi-Fi, brightness, sound, time, records, system info."
-  "NOTES: Create, edit and save notes to SD. OK: open, hold OK: actions, BACK: exit.",
+  "NOTES: Create, edit and save notes to SD. OK: open, hold OK: actions, BACK: exit."
+"SETTINGS: Configure device. Wi-Fi, brightness, sound, time, records, system info.",
 };
 
 const char* GAME_DOCS_RU[APP_COUNT] = {
@@ -865,8 +900,8 @@ const char* GAME_DOCS_RU[APP_COUNT] = {
   "ЛАБИРИНТ: Найди выход. Новый случайный лабиринт на каждом уровне.",
   "ПРЫГУН: Прыгай вверх по платформам. ВЛЕВО/ВПРАВО движение. Камера следит.",
   "SUPER MARIO: Четыре уровня, враги, монеты, звезда и босс. ВЛЕВО/ВПРАВО — движение, ВВЕРХ/OK — прыжок.",
-  "НАСТРОЙКИ: Настройки устройства. Wi-Fi, яркость, звук, время, рекорды."
-  "ЗАМЕТКИ: Создавай, редактируй и сохраняй заметки на SD. OK: открыть, удержание OK: действия, BACK: выход.",
+  "ЗАМЕТКИ: Создавай, редактируй и сохраняй заметки на SD. OK: открыть, удержание OK: действия, BACK: выход."
+"НАСТРОЙКИ: Настройки устройства. Wi-Fi, яркость, звук, время, рекорды.",
 };
 
 const char* GAME_DOCS_UA[APP_COUNT] = {
@@ -893,8 +928,62 @@ const char* GAME_DOCS_UA[APP_COUNT] = {
   "ЛАБІРИНТ: Знайди вихід. Новий випадковий лабіринт на кожному рівні.",
   "СТРИБУН: Стрибай вгору по платформах. ВЛІВО/ВПРАВО рух. Камера стежить.",
   "SUPER MARIO: Чотири рівні, вороги, монети, зірка та бос. ВЛІВО/ВПРАВО — рух, ВГОРУ/OK — стрибок.",
-  "НАЛАШТУВАННЯ: Налаштування пристрою. Wi-Fi, яскравість, звук, час, рекорди."
-  "НОТАТКИ: Створюй, редагуй та зберігай нотатки на SD. OK: відкрити, утримання OK: дії, BACK: вихід.",
+  "НОТАТКИ: Створюй, редагуй та зберігай нотатки на SD. OK: відкрити, утримання OK: дії, BACK: вихід."
+"НАЛАШТУВАННЯ: Налаштування пристрою. Wi-Fi, яскравість, звук, час, рекорди.",
+};
+const char* GAME_DOCS_DE[APP_COUNT] = {
+  "DINO LAUF: Springe ueber Kakteen. OK/HOCH = Sprung.",
+  "FLAPPY: Tippe OK/HOCH zum Flattern.",
+  "TETRIS: LINKS/RECHTS, HOCH/OK drehen, RUNTER fallen.",
+  "SCHLANGE: Friss Futter, meide Waende.",
+  "PONG: HOCH/RUNTER. Gewinne bis 5.",
+  "BREAKOUT: Zerstoere alle Steine.",
+  "INVADERS: LINKS/RECHTS, OK feuert. 10 pro Alien.",
+  "ASTEROIDEN: Drehen, schieben, feuern. 3 Leben.",
+  "MINEN: OK aufdecken, BACK markieren.",
+  "2048: Verschmelze Kacheln bis 2048.",
+  "SIMON: HOCH/LINKS/RECHTS/OK = 4 Tasten.",
+  "FROSCH: Ueberquere Strasse, meide Autos.",
+  "TIC-TAC-TOE: Drei in einer Reihe.",
+  "GEMINI: Braucht WLAN.",
+  "LABYRINTH-SCHLANGE: Meide Waende, wachse.",
+  "MEMORY: Finde alle 8 Paare.",
+  "SKATER: OK/HOCH springen.",
+  "PANZER: Pfeile, OK feuert.",
+  "STERNE: LINKS/RECHTS. Gold = 3 Punkte.",
+  "REAKTION: Warte auf LOS, dann OK.",
+  "LABYRINTH: Finde Ausgang. Neues Level.",
+  "SPRINGER: LINKS/RECHTS. Kamera folgt.",
+  "SUPER MARIO: LINKS/RECHTS, HOCH/OK springen.",
+  "NOTIZEN: OK oeffnen, halten Aktionen, BACK raus.",
+  "EINSTELLUNGEN: WLAN, Helligkeit, Ton, Rekorde."
+};
+const char* GAME_DOCS_FR[APP_COUNT] = {
+  "DINO COURSE: Saute par-dessus les cactus.",
+  "FLAPPY: Tape OK/HAUT pour voler.",
+  "TETRIS: GAUCHE/DROITE, HAUT/OK rotation.",
+  "SERPENT: Mange, evite les murs.",
+  "PONG: HAUT/BAS. Gagne a 5.",
+  "CASSE-BRIQUES: Detruis toutes les briques.",
+  "ENVAHISSEURS: GAUCHE/DROITE, OK tire.",
+  "ASTEROIDES: Tourne, pousse, tire.",
+  "DEMINEUR: OK reveler, BACK marquer.",
+  "2048: Fusionne les tuiles.",
+  "SIMON: Repete la sequence.",
+  "GRENOUILLE: Traverse la route.",
+  "MORPION: Aligne 3 symboles.",
+  "GEMINI: Necessite Wi-Fi.",
+  "SERPENT LABYRINTHE: Evite les murs.",
+  "MEMORY: Trouve les paires.",
+  "SKATEUR: Saute par-dessus.",
+  "TANK: Fleches, OK tire.",
+  "ETOILES: Attrape avec le sac.",
+  "REACTION: Attends, tape OK.",
+  "LABYRINTHE: Trouve la sortie.",
+  "SAUTEUR: Monte les plateformes.",
+  "SUPER MARIO: GAUCHE/DROITE, HAUT/OK sauter.",
+  "NOTES: Cree des notes sur SD.",
+  "PARAMETRES: Configurer l'appareil."
 };
 
 // ============ AUDIO ============
@@ -969,6 +1058,11 @@ void saveCfg() {
   prefs.putUChar("lang", cfg.lang);
   prefs.putBool("filetypes", cfg.showFileTypes);
   prefs.putBool("setwrap", cfg.settingsWrap);
+  prefs.putBytes("appord", appOrder, sizeof(appOrder));
+  prefs.putBool("pin_en", g_pinEnabled);
+  prefs.putString("pin_code", g_pinCode);
+  prefs.putUChar("langcount", cfg.langCount);
+  prefs.putUChar("langcount", cfg.langCount);
   prefs.putBool("joy", joystickEnabled);
   prefs.putInt("jcx", joyCenterX); prefs.putInt("jcy", joyCenterY);
   prefs.putInt("jminx", joyMinX); prefs.putInt("jmaxx", joyMaxX);
@@ -978,7 +1072,7 @@ void loadCfg() {
   cfg.bright = prefs.getUChar("bright",2)&3;
   cfg.invert = prefs.getBool("inv",false);
   cfg.showPass = prefs.getBool("showpw",false);
-  cfg.layout = prefs.getUChar("layout",0)%3;
+  cfg.layout = prefs.getUChar("layout",0)%4;
   cfg.rep = prefs.getUChar("rep",1)%3;
   cfg.showFps = prefs.getBool("fps",false);
   cfg.autoConn = prefs.getBool("auto",true);
@@ -990,9 +1084,11 @@ void loadCfg() {
   cfg.showClock = prefs.getBool("clkshow",true);
   cfg.clock24h = prefs.getBool("clk24",true);
   cfg.autoTime = prefs.getBool("autotime",true);
-  cfg.lang = prefs.getUChar("lang",0)%3;
+  cfg.lang = prefs.getUChar("lang",0)%4;
   cfg.showFileTypes = prefs.getBool("filetypes", true);
   cfg.settingsWrap = prefs.getBool("setwrap", true);
+  cfg.langCount = constrain(prefs.getUChar("langcount", 3), 1, 5);
+  cfg.langCount = constrain(prefs.getUChar("langcount", 3), 1, 5);
   joystickEnabled = false; // joystick removed; GPIOs reserved for SD SPI
   joyCenterX = constrain(prefs.getInt("jcx", 2048), 0, 4095);
   joyCenterY = constrain(prefs.getInt("jcy", 2048), 0, 4095);
@@ -1012,6 +1108,9 @@ void loadCfg() {
   cfg.btnGpioRight = prefs.getUChar("btn_right", 1);
   cfg.btnGpioOk = prefs.getUChar("btn_ok", 2);
   cfg.btnGpioBack = prefs.getUChar("btn_back", 6);
+  prefs.getBytes("appord", appOrder, sizeof(appOrder));
+  g_pinEnabled = prefs.getBool("pin_en", false);
+  g_pinCode = prefs.getString("pin_code", "");
 }
 int getBest(int id) { char k[8]; snprintf(k,sizeof k,"b%d",id); return prefs.getInt(k,0); }
 void setBest(int id, int v) {
@@ -1046,47 +1145,54 @@ int mapAxis(int val, int center, int minVal, int maxVal) {
 }
 
 void sendHeartbeat() {
-  if (WiFi.status() != WL_CONNECTED) return;
-  String storeUrl = prefs.getString("store_url", "http://monoxide-divinity-dividable.ngrok-free.dev");
-  if (!storeUrl.length()) return;
-
+  lastHbTime = millis();
+  if (WiFi.status() != WL_CONNECTED) { lastHbResult = "wifi_off"; return; }
+  String storeUrl = prefs.getString("store_url", "");
+  if (!storeUrl.length()) { lastHbResult = "url_empty"; return; }
   String host; int port = 80;
   String url = storeUrl;
-  if (url.startsWith("http://")) url = url.substring(7);
+  if (url.startsWith("http://")) { url = url.substring(7); port = 80; }
+  else if (url.startsWith("https://")) { url = url.substring(8); port = 443; }
   int slash = url.indexOf('/');
   String hp = (slash < 0) ? url : url.substring(0, slash);
   int colon = hp.indexOf(':');
   if (colon >= 0) { host = hp.substring(0, colon); port = hp.substring(colon + 1).toInt(); }
   else { host = hp; }
-
-  String body = "{";
-  body += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
-  body += "\"mac\":\"" + WiFi.macAddress() + "\",";
-  body += "\"version\":\"" FIRMWARE_VERSION "\",";
-  body += "\"modules\":" FIRMWARE_MODULES_JSON;
-  body += "}";
-
-  WiFiClient hc;
-  hc.setTimeout(500);
-  if (hc.connect(host.c_str(), port)) {
-    hc.print("POST /api/heartbeat HTTP/1.1\r\n");
-    hc.print("Host: " + host + "\r\n");
-    hc.print("Content-Type: application/json\r\n");
-    hc.print("Content-Length: " + String(body.length()) + "\r\n");
-    hc.print("Connection: close\r\n\r\n");
-    hc.print(body);
-    delay(80);
-    hc.stop();
-  }
+  String macA = WiFi.macAddress();
+  if (macA.length() < 10 || macA == "00:00:00:00:00:00") macA = WiFi.softAPmacAddress();
+  String body = "{\"ip\":\"" + WiFi.localIP().toString() + "\",\"mac\":\"" + macA + "\",\"version\":\"" FIRMWARE_VERSION "\",\"modules\":" FIRMWARE_MODULES_JSON "}";
+  WiFiClientSecure hc;
+  hc.setInsecure();
+  hc.setTimeout(15);
+  yield();
+  int cr = hc.connect(host.c_str(), port, 15000);
+  if (!cr) { lastHbResult = "conn_fail"; return; }
+  hc.print("POST /api/heartbeat HTTP/1.1\r\n");
+  hc.print("Host: " + host + "\r\n");
+  hc.print("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36\r\n");
+  hc.print("Accept: application/json, text/plain, */*\r\n");
+  hc.print("Accept-Language: en-US,en;q=0.9\r\n");
+  hc.print("Content-Type: application/json\r\n");
+  hc.print("Content-Length: " + String(body.length()) + "\r\n");
+  hc.print("skip_zrok_interstitial: true\r\n");
+  hc.print("Connection: close\r\n\r\n");
+  hc.print(body);
+  uint32_t tmo = millis();
+  while (hc.available() == 0 && millis() - tmo < 5000) { yield(); delay(10); }
+  String resp = "";
+  while (hc.available() && resp.length() < 30) { resp += (char)hc.read(); }
+  hc.stop();
+  if (resp.length() == 0) { lastHbResult = "noresp"; return; }
+  resp.replace("\r", " ");
+  resp.replace("\n", " ");
+  lastHbResult = resp;
 }
 void pollButtons() {
-  // Keep the web panel alive during menu, settings, and game input loops.
-      static uint32_t lastHB = 0;
-  if (millis() - lastHB > 15000) {
-    lastHB = millis();
-    sendHeartbeat();
-  }
-    if (!otaInProgress) serviceFileWeb();
+  // Heartbeat removed from here: it blocked the main loop for 2-5 s.
+  // It is now sent manually (once after saving Store URL, or on demand
+  // from Settings). The web panel keeps itself alive via HTTP.
+    static uint32_t lastWebPoll = 0;
+  if (!otaInProgress && millis() - lastWebPoll > 80) { lastWebPoll = millis(); serviceFileWeb(); }
   uint32_t now = millis();
   joyOkTapEvent = false;
   
@@ -1213,8 +1319,8 @@ void drawSystemStatus() {
     char clockText[9];
     snprintf(clockText,sizeof(clockText), cfg.clock24h?"%02d:%02d":"%2d:%02d", hour, tmNow.tm_min);
     oled.setDrawColor(0); oled.drawBox(86,0,42,9); oled.setDrawColor(1);
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
-    oled.drawStr(128-oled.getStrWidth(clockText),7,clockText);
+    oled.setFont(uiFontSmall());
+    oled.drawUTF8(128-oled.getUTF8Width(clockText),7,clockText);
   }
 }
 void updateNetworkClock() {
@@ -1232,7 +1338,7 @@ void present() {
     if (millis()-fpsT>=1000) { fpsVal=fpsCnt; fpsCnt=0; fpsT=millis(); }
     oled.setFont(u8g2_font_4x6_tr);
     String s = "F"+String(fpsVal);
-    oled.drawStr(128-oled.getStrWidth(s.c_str()),63,s.c_str());
+    oled.drawUTF8(128-oled.getUTF8Width(s.c_str()),63,s.c_str());
   }
   updateNetworkClock();
   rtcService();
@@ -1246,10 +1352,10 @@ void frameWait(uint32_t t0) {
 }
 void showScreen(const char* title, const String& a,const String& b, const String& c) {
   oled.clearBuffer();
-  oled.setFont(u8g2_font_6x13_t_cyrillic);
+  oled.setFont(uiFontLarge());
   oled.drawUTF8(0,12,title);
   oled.drawHLine(0,16,128);
-  oled.setFont(u8g2_font_5x8_t_cyrillic);
+  oled.setFont(uiFontSmall());
   if (a.length()) oled.drawUTF8(4,30,a.c_str());
   if (b.length()) oled.drawUTF8(4,42,b.c_str());
   if (c.length()) oled.drawUTF8(4,54,c.c_str());
@@ -1258,10 +1364,10 @@ void showScreen(const char* title, const String& a,const String& b, const String
 void overlayBox(const char* a, const char* b) {
   oled.drawRBox(12,18,104,30,4);
   oled.setDrawColor(0);
-  oled.setFont(u8g2_font_6x13_t_cyrillic);
-  oled.drawStr(64-oled.getStrWidth(a)/2,31,a);
-  oled.setFont(u8g2_font_5x8_t_cyrillic);
-  oled.drawStr(64-oled.getStrWidth(b)/2,43,b);
+  oled.setFont(uiFontLarge());
+  oled.drawUTF8(64-oled.getUTF8Width(a)/2,31,a);
+  oled.setFont(uiFontSmall());
+  oled.drawUTF8(64-oled.getUTF8Width(b)/2,43,b);
   oled.setDrawColor(1);
 }
 String padNum(int v, int digits) {
@@ -1422,7 +1528,7 @@ void drawIcon(int id, int cx, int cy) {
       oled.drawLine(cx-7,cy,cx+7,cy); oled.drawLine(cx,cy-7,cx,cy+7); break; }
     case APP_2048: {
       oled.drawFrame(cx-11,cy-7,22,14);
-      oled.setFont(u8g2_font_4x6_tr); oled.drawStr(cx-8,cy+3,"2048"); break; }
+      oled.setFont(u8g2_font_4x6_tr); oled.drawUTF8(cx-8,cy+3,"2048"); break; }
     case APP_SIMON: {
       oled.drawRBox(cx-9,cy-8,8,7,1); oled.drawRFrame(cx+1,cy-8,8,7,1);
       oled.drawRFrame(cx-9,cy+1,8,7,1); oled.drawRBox(cx+1,cy+1,8,7,1); break; }
@@ -1505,6 +1611,7 @@ void drawIcon(int id, int cx, int cy) {
 const char* keysEN[] = {"q","w","e","r","t","y","u","i","o","p","a","s","d","f","g","h","j","k","l","z","x","c","v","b","n","m"};
 const char* keysRU[] = {"й","ц","у","к","е","н","г","ш","щ","з","х","ъ","ф","ы","в","а","п","р","о","л","д","ж","э","я","ч","с","м","и","т","ь","б","ю","ё"};
 const char* keysUA[] = {"й","ц","у","к","е","н","г","ш","щ","з","х","ї","ф","і","в","а","п","р","о","л","д","ж","є","я","ч","с","м","и","т","ь","б","ю"};
+const char* keysNUM_DE[] = {"1","2","3","4","5","6","7","8","9","0","!","\"","§","$","%","&","/","(",")","=","?","`","´","+","*","#","'","<",">","|","~","@","€"};
 const char* keysNUM[] = {"1","2","3","4","5","6","7","8","9","0","-","+","=","/","\\","(",")","[","]","!","?","@",":",";","'","\"","_","&","%","#","*",".",","};
 const char* ACT_LABEL[5] = {"SP","CAP","DEL","123","OK"};
 
@@ -1518,6 +1625,7 @@ int kbKeyCount() {
 }
 int kbCharRows() { return (kbKeyCount()+9)/10; }
 const char* kbKey(int i) {
+  if (kbNumbers && kbLayout == 3) return keysNUM_DE[i];
   if (kbNumbers) return keysNUM[i];
   if (kbLayout==1) return keysRU[i];
   if (kbLayout==2) return keysUA[i];
@@ -1583,35 +1691,67 @@ void kbMove(int dr, int dc) {
   }
 }
 
-void drawKeyboard(const char* title, const String& text, bool secret, bool allowAttach = false) {
+const uint8_t* kbFontFor() {
+  if (kbLayout == 1 || kbLayout == 2) return u8g2_font_5x8_t_cyrillic;
+  return u8g2_font_5x8_tf;
+}
+void drawKeyboard(const char* title, const String& text, bool secret, int cursorPos, bool isEditingText, bool allowAttach = false) {
   oled.clearBuffer();
-  oled.setFont(u8g2_font_6x13_t_cyrillic);
+  oled.setDrawColor(1);
+  oled.setFont(uiFontLarge());
   oled.drawUTF8(0, 12, title);
-  oled.setFont(u8g2_font_5x8_t_cyrillic);
-  const char* tag = kbNumbers ? "123" : (kbLayout == 0 ? "EN" : kbLayout == 1 ? "RU" : "UA");
-  int tw = oled.getStrWidth(tag);
+  oled.setFont(kbLayout==3 ? u8g2_font_tom_thumb_4x6_te : u8g2_font_5x8_t_cyrillic);
+  const char* tag = kbNumbers ? "123" : (kbLayout == 0 ? "EN" : kbLayout == 1 ? "RU" : kbLayout == 2 ? "UA" : "DE");
+  int tw = oled.getUTF8Width(tag);
   oled.drawRBox(126 - tw - 6, 1, tw + 6, 10, 3);
-  oled.setDrawColor(0); oled.drawStr(126 - tw - 3, 9, tag); oled.setDrawColor(1);
+  oled.setDrawColor(0); oled.drawUTF8(126 - tw - 3, 9, tag); oled.setDrawColor(1);
   oled.drawHLine(0, 14, 128);
-
-  // Индикатор прикреплённого файла (справа от EN/RU/UA)
   if (allowAttach && pendingAttachPath.length() > 0) {
     oled.setFont(u8g2_font_4x6_tr);
-    oled.drawStr(70, 9, "[SD+]");
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
+    oled.drawUTF8(70, 9, "[SD+]");
+    oled.setFont(uiFontSmall());
   }
-
   String shown = "";
   if (secret && !cfg.showPass) { for (unsigned int i = 0; i < text.length(); i++) shown += '*'; }
   else shown = text;
-  while (shown.length() && oled.getUTF8Width((shown + "_").c_str()) > 122) dropFirstChar(shown);
-  bool cursorOn = (millis() / 400) % 2 == 0;
-  oled.drawUTF8(2, 24, (shown + (cursorOn ? "_" : " ")).c_str());
-
+  int realCur = cursorPos;
+  if (realCur < 0) realCur = 0;
+  if (realCur > (int)shown.length()) realCur = shown.length();
+  int startIdx = 0;
+  int cursorW = 0;
+  if (realCur > 0) cursorW = oled.getUTF8Width(shown.substring(0, realCur).c_str());
+  if (cursorW > 116) {
+    int needScroll = cursorW - 116;
+    while (startIdx < (int)shown.length()) {
+      int w = oled.getUTF8Width(shown.substring(0, startIdx).c_str());
+      if (w >= needScroll) break;
+      startIdx++;
+      while (startIdx < (int)shown.length() && (shown[startIdx] & 0xC0) == 0x80) startIdx++;
+    }
+  }
+  String drawText = shown.substring(startIdx);
+  if (isEditingText) {
+    oled.drawRBox(0, 16, 128, 11, 2);
+    oled.setDrawColor(0);
+    oled.drawUTF8(2, 24, drawText.c_str());
+    if ((millis() / 400) % 2 == 0) {
+      int dc = realCur - startIdx;
+      if (dc < 0) dc = 0;
+      if (dc > (int)drawText.length()) dc = drawText.length();
+      int cw = oled.getUTF8Width(drawText.substring(0, dc).c_str());
+      oled.drawBox(2 + cw, 17, 2, 8);
+    }
+    oled.setDrawColor(1);
+  } else {
+    oled.drawUTF8(2, 24, drawText.c_str());
+    if ((millis() / 400) % 2 == 0) {
+      int w = oled.getUTF8Width(drawText.c_str());
+      oled.drawUTF8(2 + w, 24, "_");
+    }
+  }
   int n = kbKeyCount();
   int actCount = allowAttach ? 6 : 5;
   int total = n + actCount;
-
   for (int idx = 0; idx < total; idx++) {
     int r, c;
     kbPos(idx, r, c);
@@ -1634,7 +1774,7 @@ void drawKeyboard(const char* title, const String& text, bool secret, bool allow
       }
     }
     int tx = bx + (bw - oled.getUTF8Width(label.c_str())) / 2;
-    if (idx == kbSel) {
+    if (idx == kbSel && !isEditingText) {
       oled.drawRBox(bx, y - 6, bw, 8, 2);
       oled.setDrawColor(0);
       oled.drawUTF8(tx, y, label.c_str());
@@ -1651,30 +1791,53 @@ bool runKeyboard(const char* title, String& text, bool secret, bool allowAttach 
   kbLayout = cfg.layout; kbSel = 0; kbNumbers = false;
   kbActionCount = allowAttach ? 6 : 5;
   if (!allowAttach) pendingAttachPath = "";
+  int cursor = text.length();
+  bool isEditingText = false;
+  auto moveCursor = [&](int dir) {
+    int len = (int)text.length();
+    if (dir < 0) {
+      if (cursor <= 0) { cursor = 0; return; }
+      int c = cursor - 1;
+      while (c > 0 && (((uint8_t)text[c]) & 0xC0) == 0x80) c--;
+      cursor = c;
+    } else {
+      if (cursor >= len) { cursor = len; return; }
+      int c = cursor + 1;
+      while (c < len && (((uint8_t)text[c]) & 0xC0) == 0x80) c++;
+      cursor = c;
+    }
+  };
 
   while (true) {
     uint32_t t0 = millis();
     pollButtons();
     if (evLong[BI_BACK]) { kbActionCount = 5; return false; }
-    if (nav(BI_UP)) kbMove(-1, 0);
+    if (isEditingText) {
+      if (nav(BI_LEFT)) { moveCursor(-1); SFX(SF_MOVE); }
+      if (nav(BI_RIGHT)) { moveCursor(1); SFX(SF_MOVE); }
+      if (evDown[BI_DOWN]) { isEditingText = false; SFX(SF_CLICK); }
+      if (evDown[BI_OK]) { moveCursor(1); SFX(SF_CLICK); }
+    } else {
+        if (nav(BI_UP)) { if (kbSel < 10) { isEditingText = true; SFX(SF_CLICK); } else { kbMove(-1, 0); } }
     if (nav(BI_DOWN)) kbMove(1, 0);
     if (nav(BI_LEFT)) { kbMove(0, -1); SFX(SF_MOVE); }
     if (nav(BI_RIGHT)) { kbMove(0, 1); SFX(SF_MOVE); }
+    }
 
     if (evDown[BI_OK]) {
       int n = kbKeyCount();
       if (kbSel < n) {
         String k = kbKey(kbSel);
         if (kbUpper && !kbNumbers) k = upperKey(k);
-        if (text.length() < 300) text += k;
+        if (text.length() < 300) { text += k; cursor = text.length(); }
         SFX(SF_CLICK);
       } else {
         int a = kbSel - n;
         if (allowAttach) {
           switch (a) {
-            case 0: text += " "; break;
+            case 0: text = text.substring(0, cursor) + " " + text.substring(cursor); cursor++; break;
             case 1: kbUpper = !kbUpper; break;
-            case 2: dropLastChar(text); break;
+            case 2: if (cursor > 0) { int pc = cursor - 1; while (pc > 0 && (((uint8_t)text[pc]) & 0xC0) == 0x80) pc--; text.remove(pc, cursor - pc); cursor = pc; } break;
             case 3: kbNumbers = !kbNumbers; kbSel = 0; break;
             case 4: {
               // Открываем выбор файла с SD
@@ -1688,9 +1851,9 @@ bool runKeyboard(const char* title, String& text, bool secret, bool allowAttach 
           }
         } else {
           switch (a) {
-            case 0: text += " "; break;
+            case 0: text = text.substring(0, cursor) + " " + text.substring(cursor); cursor++; break;
             case 1: kbUpper = !kbUpper; break;
-            case 2: dropLastChar(text); break;
+            case 2: if (cursor > 0) { int pc = cursor - 1; while (pc > 0 && (((uint8_t)text[pc]) & 0xC0) == 0x80) pc--; text.remove(pc, cursor - pc); cursor = pc; } break;
             case 3: kbNumbers = !kbNumbers; kbSel = 0; break;
             case 4: return true;
           }
@@ -1699,11 +1862,11 @@ bool runKeyboard(const char* title, String& text, bool secret, bool allowAttach 
     }
     if (evTap[BI_BACK]) {
       if (kbNumbers) kbNumbers = false;
-      else kbLayout = (kbLayout + 1) % 3;
+      else kbLayout = (kbLayout + 1) % 4;
       kbSel = 0;
       SFX(SF_OPEN);
     }
-    drawKeyboard(title, text, secret, allowAttach);
+    drawKeyboard(title, text, secret, cursor, isEditingText, allowAttach);
     frameWait(t0);
   }
 }
@@ -1726,10 +1889,11 @@ String askAI(const String& prompt,
              const String& mimeType = "") {
   if (WiFi.status()!=WL_CONNECTED) return "Wi-Fi offline.";
   WiFiClientSecure client; client.setInsecure();
-  HTTPClient https; https.setTimeout(60000);
+  HTTPClient https; https.setTimeout(8000);
   if (!https.begin(client, API_URL)) return "HTTPS init failed.";
   https.addHeader("Content-Type","application/json");
   https.addHeader("x-goog-api-key", GEMINI_API_KEY);
+  https.addHeader("skip_zrok_interstitial", "true");
   JsonDocument request;
   JsonArray contents = request["contents"].to<JsonArray>();
   JsonObject content = contents.add<JsonObject>();
@@ -1755,9 +1919,13 @@ String askAI(const String& prompt,
     if (!https.begin(client, API_URL)) return "HTTPS init failed.";
     https.addHeader("Content-Type","application/json");
     https.addHeader("x-goog-api-key", GEMINI_API_KEY);
+  https.addHeader("skip_zrok_interstitial", "true");
   }
   https.end();
   if (status!=200) return "Gemini HTTP error "+String(status);
+  if (response.length() > 0 && response.charAt(0) == 60) return "Tunnel HTML (password page).";
+  if (response.length() > 0 && response.charAt(0) == 60) return "Туннель вернул HTML. Проверь URL.";
+  if (response.length() > 0 && response.charAt(0) == 60) return "Туннель вернул HTML (страница пароля). Проверь URL.";
   JsonDocument result;
   DeserializationError err = deserializeJson(result, response);
   if (err) return "Bad JSON from Gemini.";
@@ -1768,7 +1936,7 @@ String askAI(const String& prompt,
 const int MAX_LINES = 120;
 String answerLines[MAX_LINES];
 int wrapText(const String& src) {
-  oled.setFont(u8g2_font_5x8_t_cyrillic);
+  oled.setFont(uiFontSmall());
   String t = src; t.replace('\n',' ');
   int n=0; String line=""; int start=0;
   while (n<MAX_LINES) {
@@ -1797,11 +1965,11 @@ bool showAnswer(const String& text) {
     if (nav(BI_LEFT)) top = max(0, top-6);
     if (nav(BI_RIGHT)) top = min(maxTop, top+6);
     oled.clearBuffer();
-    oled.setFont(u8g2_font_6x13_t_cyrillic);
+    oled.setFont(uiFontLarge());
     oled.drawUTF8(0,12,"Gemini");
     drawSparkle(118,7,4);
     oled.drawHLine(0,16,128);
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
+    oled.setFont(uiFontSmall());
     for (int i=0;i<6;i++) {
       int idx = top+i;
       if (idx>=n) break;
@@ -1854,11 +2022,11 @@ String chooseSdFile() {
     if (evTap[BI_BACK] || evLong[BI_BACK]) return "";
     if (count == 0) {
       oled.clearBuffer();
-      oled.setFont(u8g2_font_6x13_t_cyrillic);
-      oled.drawStr(0,12,"No files");
-      oled.setFont(u8g2_font_5x8_t_cyrillic);
-      oled.drawStr(0,30,path.c_str());
-      oled.drawStr(0,50,"BACK: cancel");
+      oled.setFont(uiFontLarge());
+      oled.drawUTF8(0,12,"No files");
+      oled.setFont(uiFontSmall());
+      oled.drawUTF8(0,30,path.c_str());
+      oled.drawUTF8(0,50,"BACK: cancel");
       present(); frameWait(t0);
       continue;
     }
@@ -1873,12 +2041,12 @@ String chooseSdFile() {
       return e.full;
     }
     oled.clearBuffer();
-    oled.setFont(u8g2_font_6x13_t_cyrillic);
-    oled.drawStr(0, 11, "Pick file");
+    oled.setFont(uiFontLarge());
+    oled.drawUTF8(0, 11, "Pick file");
     oled.drawHLine(0, 14, 128);
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
+    oled.setFont(uiFontSmall());
     String pt = path; if (pt.length() > 20) pt = "..." + pt.substring(pt.length()-17);
-    oled.drawStr(0, 23, pt.c_str());
+    oled.drawUTF8(0, 23, pt.c_str());
     for (int r = 0; r < 4; r++) {
       int idx = (sel/4)*4 + r;
       if (idx >= count) break;
@@ -1886,7 +2054,7 @@ String chooseSdFile() {
       if (idx == sel) { oled.drawRBox(0, y-6, 128, 8, 2); oled.setDrawColor(0); }
       String nm = items[idx].dir ? ("[" + items[idx].name + "]") : items[idx].name;
       if (nm.length() > 21) nm = nm.substring(0, 21);
-      oled.drawStr(2, y, nm.c_str());
+      oled.drawUTF8(2, y, nm.c_str());
       if (idx == sel) oled.setDrawColor(1);
     }
     present(); frameWait(t0);
@@ -1990,13 +2158,13 @@ void runWifiScan() {
       waitRelease(); continue;
     }
     oled.clearBuffer();
-    oled.setFont(u8g2_font_6x13_t_cyrillic);
+    oled.setFont(uiFontLarge());
     oled.drawUTF8(0,12,"Wi-Fi");
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
+    oled.setFont(uiFontSmall());
     String cnt = String(netCount)+" found";
-    oled.drawStr(128-oled.getStrWidth(cnt.c_str()),11,cnt.c_str());
+    oled.drawUTF8(128-oled.getUTF8Width(cnt.c_str()),11,cnt.c_str());
     oled.drawHLine(0,15,128);
-    if (netCount==0) oled.drawStr(4,36,"No networks");
+    if (netCount==0) oled.drawUTF8(4,36,"No networks");
     for (int i=0;i<ROWS;i++) {
       int idx = top+i; if (idx>=netCount) break;
       int y = 18+i*11;
@@ -2072,24 +2240,24 @@ void runRecords() {
     if (sel<top) top=sel;
     if (sel>=top+ROWS) top=sel-ROWS+1;
     oled.clearBuffer();
-    oled.setFont(u8g2_font_6x13_t_cyrillic);
+    oled.setFont(uiFontLarge());
     const char* lngTag = cfg.lang==0?"EN":cfg.lang==1?"RU":"UA";
-    oled.drawStr(0,12,"Records");
+    oled.drawUTF8(0,12,"Records");
     oled.setFont(u8g2_font_4x6_tr);
-    oled.drawStr(68,9,lngTag);
-    oled.drawStr(92,9,"BEST");
-    oled.drawStr(118,9,"RUN");
+    oled.drawUTF8(68,9,lngTag);
+    oled.drawUTF8(92,9,"BEST");
+    oled.drawUTF8(118,9,"RUN");
     oled.drawHLine(0,16,128);
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
+    oled.setFont(uiFontSmall());
     for (int i=0;i<ROWS;i++) {
       int idx = top+i; if (idx>=REC_N) break;
       int y = 27+i*9;
       if (idx==sel) { oled.drawRBox(0,y-7,128,9,2); oled.setDrawColor(0); }
       oled.drawUTF8(3,y,appName(idx));
       String best = idx==APP_GEMINI ? String("-") : String(getBest(idx));
-      oled.drawStr(104-oled.getStrWidth(best.c_str()),y,best.c_str());
+      oled.drawUTF8(104-oled.getUTF8Width(best.c_str()),y,best.c_str());
       String runs = String(getPlays(idx));
-      oled.drawStr(125-oled.getStrWidth(runs.c_str()),y,runs.c_str());
+      oled.drawUTF8(125-oled.getUTF8Width(runs.c_str()),y,runs.c_str());
       oled.setDrawColor(1);
     }
     time_t bestTs = (time_t)prefs.getLong64((String("d")+String(sel)).c_str(),0);
@@ -2099,7 +2267,7 @@ void runRecords() {
         char dateLine[24];
         snprintf(dateLine,sizeof(dateLine),"%02d.%02d.%04d",bt.tm_mday,bt.tm_mon+1,bt.tm_year+1900);
         oled.setDrawColor(0); oled.drawBox(0,54,128,10); oled.setDrawColor(1);
-        oled.drawStr(2,62,dateLine);
+        oled.drawUTF8(2,62,dateLine);
       }
     }
     present(); frameWait(t0);
@@ -2119,7 +2287,7 @@ void resetScores() {
 // ============ ДОКУМЕНТАЦИЯ ИГРЫ ============
 String docLines[24];
 int wrapDocText(const char* src) {
-  oled.setFont(u8g2_font_5x8_t_cyrillic);
+  oled.setFont(uiFontSmall());
   String t = String(src);
   t.replace('\n',' ');
   int n=0; String line=""; int start=0;
@@ -2141,8 +2309,9 @@ void showGameDocs(int id) {
   if (id == APP_FILE_MANAGER) { showScreen("File Manager", "OK: open", "Wi-Fi: MINI-BOY-FILES", "192.168.4.1"); waitAnyKey(); return; }
   if (id < 0 || id >= APP_COUNT) return;
   waitRelease();
-  const char* texts[3] = { GAME_DOCS_EN[id], GAME_DOCS_RU[id], GAME_DOCS_UA[id] };
-  int n = wrapDocText(texts[cfg.lang]);
+  const char* texts[5] = { GAME_DOCS_EN[id], GAME_DOCS_RU[id], GAME_DOCS_UA[id], GAME_DOCS_DE[id], GAME_DOCS_FR[id] };
+  int safeLang = (cfg.lang >= 0 && cfg.lang < 5) ? cfg.lang : 0;
+  int n = wrapDocText(texts[safeLang]);
   int top = 0;
   while (true) {
     uint32_t t0 = millis();
@@ -2151,7 +2320,7 @@ void showGameDocs(int id) {
     // for 2.5 seconds exits the help screen without changing the language.
     if (evTap[BI_OK] || evLong[BI_BACK]) return;
     if (evTap[BI_BACK]) {
-      cfg.lang = (cfg.lang + 1) % 3;
+      cfg.lang = (cfg.lang + 1) % max((uint8_t)1, cfg.langCount);
       saveCfg();
       n = wrapDocText(texts[cfg.lang]);
       top = 0;
@@ -2163,7 +2332,7 @@ void showGameDocs(int id) {
     if (nav(BI_DOWN) && top<maxTop) top++;
 
     oled.clearBuffer();
-    oled.setFont(u8g2_font_6x13_t_cyrillic);
+    oled.setFont(uiFontLarge());
     String title = String(appName(id));
     while (oled.getUTF8Width(title.c_str()) > 100 && title.length() > 0) {
       title.remove(title.length()-1);
@@ -2171,12 +2340,12 @@ void showGameDocs(int id) {
     oled.drawUTF8(0,12,title.c_str());
     oled.setFont(u8g2_font_4x6_tr);
     const char* lngTag = cfg.lang==0?"EN":cfg.lang==1?"RU":"UA";
-    oled.drawStr(120,9,lngTag);
+    oled.drawUTF8(120,9,lngTag);
     oled.drawHLine(0,16,128);
     oled.setFont(u8g2_font_4x6_tr);
-    oled.drawStr(2,63,"OK:close  BTN6:language (hold:exit)");
+    oled.drawUTF8(2,63,"OK:close  BTN6:language (hold:exit)");
 
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
+    oled.setFont(uiFontSmall());
     for (int i=0;i<5;i++) {
       int idx = top+i; if (idx>=n) break;
       oled.drawUTF8(3,26+i*7, docLines[idx].c_str());
@@ -2191,7 +2360,53 @@ void showGameDocs(int id) {
   }
 }
 
-const char* SET_NAMES[SET_N] = {
+const char* SET_NAMES_DE[43] = {
+  "WLAN suchen","Verbinden","Netz vergessen","Passwort zeigen","Helligkeit",
+  "Anzeige invert.","Tastatur-Layout","Tastengeschw.","Soundeffekte",
+  "Musik-Thema","Lautstaerke","FPS zeigen","Auto-Verb.","Schwierigkeit",
+  "Anim-Geschw.","Uhr zeigen","Uhrformat","Auto Zeit",
+  "Datum/Zeit","Zeit sync","Rekorde","Rekorde loeschen",
+  "System-Info","Ueber","SD-Status","Boot-Logo","Dateitypen","Menue wrap",
+  "Tasten-Kalib.","Tasten reset","Werksreset","Update SD","Update Web",
+  "Store URL","Asset laden","System-Monitor","Sprach-Zyklen",
+  "Bildschirmsperre","SD speichern","SD laden","App-Reihenfolge","Store-Katalog",
+  "ZURUECK"
+};
+const char* SET_NAMES_RU[SET_N] = {
+  "Поиск Wi-Fi","Подключиться","Забыть сеть","Показать пароль","Яркость",
+  "Инверсия экрана","Раскладка","Скорость кнопок","Звуки",
+  "Музыка","Громкость","Показать FPS","Авто-подключение","Сложность",
+  "Скорость анимации","Показать часы","Формат часов","Авто время",
+  "Дата/время","Синхр. времени","Рекорды","Сброс рекордов",
+  "Инфо системы","О системе","SD статус","Boot логотип","Типы файлов","Меню зациклено",
+  "Калибровка","Сброс кнопок","Заводской сброс","Обнов. SD","Обнов. Web",
+  "Store URL","Загрузить ассет","Монитор системы","Языков в цикле",
+  "НАЗАД"
+};
+const char* SET_NAMES_UA[SET_N] = {
+  "Пошук Wi-Fi","Підключитися","Забути мережу","Показати пароль","Яскравість",
+  "Інверсія екрану","Розкладка","Швидкість кнопок","Звуки",
+  "Музика","Гучність","Показати FPS","Авто-підключення","Складність",
+  "Швидкість анімації","Показати годинник","Формат годинника","Авто час",
+  "Дата/час","Синхр. часу","Рекорди","Скинути рекорди",
+  "Інфо системи","Про систему","SD статус","Boot логотип","Типи файлів","Меню зациклено",
+  "Калібрування","Скинути кнопки","Заводський скид","Онов. SD","Онов. Web",
+  "Store URL","Завантажити асет","Монітор системи","Мов у циклі",
+  "НАЗАД"
+};
+const char* SET_NAMES_FR[SET_N] = {
+  "Rechercher Wi-Fi","Connecter","Oublier reseau","Voir mot de passe","Luminosite",
+  "Inverser ecran","Disposition","Vitesse boutons","Effets son",
+  "Theme musique","Volume","Afficher FPS","Auto-connect","Difficulte",
+  "Vitesse anim.","Afficher horloge","Format horloge","Auto heure",
+  "Date/heure","Sync heure","Records","Effacer records",
+  "Info systeme","A propos","Statut SD","Boot logo","Types fichiers","Menu boucle",
+  "Calib. boutons","Reset boutons","Reset usine","Update SD","Update Web",
+  "Store URL","Telecharger","Moniteur systeme","Cycles langue",
+  "RETOUR"
+};
+
+const char* SET_NAMES[43] = {
   "Scan Wi-Fi","Reconnect","Forget network","Show password","Brightness",
   "Invert display","Keyboard layout","Button speed","Sound effects",
   "Music theme","Volume","Show FPS","Auto-connect","Difficulty",
@@ -2199,10 +2414,16 @@ const char* SET_NAMES[SET_N] = {
   "Set time/date","Sync time Wi-Fi","Records","Reset scores",
   "System info","About","SD card status","Boot logo","File type hints","Settings wrap",
   "Button Calibration","Reset Buttons","Factory Reset","Update via SD","Update via Web",
-  "Store URL",
+  "Store URL","Download Asset","System Monitor","Language cycles",
+  "Screen Lock","Save to SD","Load from SD","App order","Store Catalog",
   "BACK"
 };
 const char* THEME_NAMES[THEME_COUNT] = {"OFF","TECH","CHILL","DARK","OLDSCHOOL"};
+const char* setName(int i) {
+  if (i < 0 || i >= SET_N) return "?";
+  if (cfg.lang == 3) return SET_NAMES_DE[i];
+  return SET_NAMES[i];
+}
 String setValue(int i) {
   switch (i) {
     case 3: return cfg.showPass?"ON":"OFF";
@@ -2224,6 +2445,7 @@ String setValue(int i) {
     case 25: return bootLogoFromSD ? "SD CARD" : "DEFAULT";
     case 26: return cfg.showFileTypes ? "ON" : "OFF";
     case 27: return cfg.settingsWrap ? "ON" : "OFF";
+    case 36: return String(cfg.langCount) + "/5";
   }
   return "";
 }
@@ -2248,6 +2470,7 @@ void setToggle(int i) {
     case 25: bootLogoFromSD = !bootLogoFromSD; prefs.putBool("bootlogo_sd", bootLogoFromSD); showScreen("Boot logo", bootLogoFromSD?"SD: /bootlogo.raw":"Default MINI-BOY", bootLogoFromSD && !SD.exists("/bootlogo.raw")?"File missing":"Saved", "Restart to apply"); waitAnyKey(); break;
     case 26: cfg.showFileTypes=!cfg.showFileTypes; break;
     case 27: cfg.settingsWrap=!cfg.settingsWrap; break;
+    case 36: cfg.langCount = (cfg.langCount % 5) + 1; break;
     case 28: return;
   }
   saveCfg();
@@ -2278,6 +2501,7 @@ void adjustSetting(int i, int direction) {
       break;
     case 26: cfg.showFileTypes = direction>0; break;
     case 27: cfg.settingsWrap = direction>0; break;
+    case 36: cfg.langCount = constrain((int)cfg.langCount + direction, 1, 5); break;
     default: return;
   }
   saveCfg();
@@ -2325,18 +2549,18 @@ void editClockManually() {
       showScreen("Time saved","Manual clock enabled","Auto sync OFF"); delay(900); return;
     }
     oled.clearBuffer();
-    oled.setFont(u8g2_font_6x13_t_cyrillic);
-    oled.drawStr(0,12,"Set date/time");
+    oled.setFont(uiFontLarge());
+    oled.drawUTF8(0,12,"Set date/time");
     oled.drawHLine(0,16,128);
     char line1[24], line2[24];
     snprintf(line1,sizeof(line1),"%02d:%02d:%02d",t.tm_hour,t.tm_min,t.tm_sec);
     snprintf(line2,sizeof(line2),"%02d.%02d.%04d",t.tm_mday,t.tm_mon+1,t.tm_year+1900);
-    oled.drawStr(16,34,line1); oled.drawStr(16,50,line2);
+    oled.drawUTF8(16,34,line1); oled.drawUTF8(16,50,line2);
     int x = field<3 ? 16+field*18 : 16+(field-3)*18;
     int y = field<3 ? 36 : 52;
     oled.drawHLine(x,y,12);
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
-    oled.drawStr(0,62,"L/R field OK save");
+    oled.setFont(uiFontSmall());
+    oled.drawUTF8(0,62,"L/R field OK save");
     present(); delay(80);
   }
 }
@@ -2363,16 +2587,16 @@ void showSystemInfo() {
                lt.tm_hour,lt.tm_min,lt.tm_sec,lt.tm_mday,lt.tm_mon+1,lt.tm_year+1900);
     float tempC = temperatureRead();
     oled.clearBuffer();
-    oled.setFont(u8g2_font_6x13_t_cyrillic);
-    oled.drawStr(0,11,"System info");
+    oled.setFont(uiFontLarge());
+    oled.drawUTF8(0,11,"System info");
     oled.drawHLine(0,15,128);
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
-    oled.drawStr(0,23,(String("Chip: ")+ESP.getChipModel()).c_str());
-    oled.drawStr(0,31,(String("CPU: ")+ESP.getCpuFreqMHz()+" MHz  "+String(tempC,1)+" C").c_str());
-    oled.drawStr(0,39,(String("Heap: ")+ESP.getFreeHeap()/1024+"/"+ESP.getHeapSize()/1024+" KB").c_str());
-    oled.drawStr(0,47,(String("Flash: ")+ESP.getFlashChipSize()/1024/1024+" MB").c_str());
-    oled.drawStr(0,55,timeLine);
-    oled.drawStr(0,63,(String(rtcPresent?"RTC OK":"RTC absent")+" "+
+    oled.setFont(uiFontSmall());
+    oled.drawUTF8(0,23,(String("Chip: ")+ESP.getChipModel()).c_str());
+    oled.drawUTF8(0,31,(String("CPU: ")+ESP.getCpuFreqMHz()+" MHz  "+String(tempC,1)+" C").c_str());
+    oled.drawUTF8(0,39,(String("Heap: ")+ESP.getFreeHeap()/1024+"/"+ESP.getHeapSize()/1024+" KB").c_str());
+    oled.drawUTF8(0,47,(String("Flash: ")+ESP.getFlashChipSize()/1024/1024+" MB").c_str());
+    oled.drawUTF8(0,55,timeLine);
+    oled.drawUTF8(0,63,(String(rtcPresent?"RTC OK":"RTC absent")+" "+
                      (WiFi.status()==WL_CONNECTED?String(WiFi.RSSI())+"dBm":"WiFi OFF")).c_str());
     present(); frameWait(t0);
   }
@@ -2424,18 +2648,18 @@ void runButtonCalibration() {
       if (detectedGpio != 255) break;  // Обнаружили нажатие
       
       oled.clearBuffer();
-      oled.setFont(u8g2_font_6x13_t_cyrillic);
-      oled.drawStr(0, 12, "Button Calibration");
+      oled.setFont(uiFontLarge());
+      oled.drawUTF8(0, 12, "Button Calibration");
       oled.drawHLine(0, 16, 128);
       
-      oled.setFont(u8g2_font_5x8_t_cyrillic);
-      oled.drawStr(2, 32, "Press button:");
-      oled.setFont(u8g2_font_6x13_t_cyrillic);
-      oled.drawStr(64 - oled.getStrWidth(btnNames[btn])/2, 50, btnNames[btn]);
+      oled.setFont(uiFontSmall());
+      oled.drawUTF8(2, 32, "Press button:");
+      oled.setFont(uiFontLarge());
+      oled.drawUTF8(64 - oled.getUTF8Width(btnNames[btn])/2, 50, btnNames[btn]);
       
-      oled.setFont(u8g2_font_5x8_t_cyrillic);
+      oled.setFont(uiFontSmall());
       int timeLeft = 5 - (millis() - startTime) / 1000;
-      oled.drawStr(2, 62, ("Timeout in " + String(timeLeft) + "s").c_str());
+      oled.drawUTF8(2, 62, ("Timeout in " + String(timeLeft) + "s").c_str());
       
       present();
       frameWait(t0);
@@ -2452,13 +2676,13 @@ void runButtonCalibration() {
     
     // Показываем что обнаружили
     oled.clearBuffer();
-    oled.setFont(u8g2_font_6x13_t_cyrillic);
-    oled.drawStr(0, 12, "Detected!");
+    oled.setFont(uiFontLarge());
+    oled.drawUTF8(0, 12, "Detected!");
     oled.drawHLine(0, 16, 128);
     
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
-    oled.drawStr(2, 32, (String(btnNames[btn]) + " = GPIO" + String(detectedGpio)).c_str());
-    oled.drawStr(2, 50, "Waiting for release...");
+    oled.setFont(uiFontSmall());
+    oled.drawUTF8(2, 32, (String(btnNames[btn]) + " = GPIO" + String(detectedGpio)).c_str());
+    oled.drawUTF8(2, 50, "Waiting for release...");
     
     present();
     waitRelease();
@@ -2499,22 +2723,22 @@ void resetButtonCalibration() {
     if (quitPressed()) return;
     
     oled.clearBuffer();
-    oled.setFont(u8g2_font_6x13_t_cyrillic);
-    oled.drawStr(0, 12, "Reset Buttons");
+    oled.setFont(uiFontLarge());
+    oled.drawUTF8(0, 12, "Reset Buttons");
     oled.drawHLine(0, 16, 128);
     
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
+    oled.setFont(uiFontSmall());
     
     if (!confirm) {
-      oled.drawStr(2, 32, "Reset button config");
-      oled.drawStr(2, 42, "to defaults?");
-      oled.drawStr(2, 54, "OK: Yes    BACK: No");
+      oled.drawUTF8(2, 32, "Reset button config");
+      oled.drawUTF8(2, 42, "to defaults?");
+      oled.drawUTF8(2, 54, "OK: Yes    BACK: No");
       
       if (evDown[BI_OK]) confirm = true;
       if (evDown[BI_BACK]) return;
     } else {
-      oled.drawStr(2, 32, "ARE YOU SURE?");
-      oled.drawStr(2, 44, "LEFT: No    RIGHT: Yes");
+      oled.drawUTF8(2, 32, "ARE YOU SURE?");
+      oled.drawUTF8(2, 44, "LEFT: No    RIGHT: Yes");
       
       if (evDown[BI_LEFT]) return;
       if (evDown[BI_RIGHT]) {
@@ -2552,24 +2776,24 @@ void runFactoryReset() {
     if (quitPressed()) return;
     
     oled.clearBuffer();
-    oled.setFont(u8g2_font_6x13_t_cyrillic);
-    oled.drawStr(0, 12, "Factory Reset");
+    oled.setFont(uiFontLarge());
+    oled.drawUTF8(0, 12, "Factory Reset");
     oled.drawHLine(0, 16, 128);
     
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
+    oled.setFont(uiFontSmall());
     
     if (!confirm) {
-      oled.drawStr(2, 32, "Clear ALL data?");
-      oled.drawStr(2, 42, "(WiFi, settings, scores)");
-      oled.drawStr(2, 54, "OK: Yes    BACK: No");
+      oled.drawUTF8(2, 32, "Clear ALL data?");
+      oled.drawUTF8(2, 42, "(WiFi, settings, scores)");
+      oled.drawUTF8(2, 54, "OK: Yes    BACK: No");
       
       if (evDown[BI_OK]) confirm = true;
       if (evDown[BI_BACK]) return;
     } else {
-      oled.drawStr(2, 24, "⚠️ FINAL CONFIRMATION");
-      oled.drawStr(2, 36, "This will erase");
-      oled.drawStr(2, 46, "ALL data permanently!");
-      oled.drawStr(2, 56, "LEFT: No    RIGHT: Yes");
+      oled.drawUTF8(2, 24, "⚠️ FINAL CONFIRMATION");
+      oled.drawUTF8(2, 36, "This will erase");
+      oled.drawUTF8(2, 46, "ALL data permanently!");
+      oled.drawUTF8(2, 56, "LEFT: No    RIGHT: Yes");
       
       if (evDown[BI_LEFT]) return;
       if (evDown[BI_RIGHT]) {
@@ -2589,10 +2813,10 @@ void runFactoryReset() {
 }
 
 void editStoreUrl() {
-  String url = prefs.getString("store_url", "http://monoxide-divinity-dividable.ngrok-free.dev");
+  String url = prefs.getString("store_url", "https://miniboy-store.shares.zrok.io");
 
   // Значение по умолчанию — подставь IP компьютера, если не задано
-  if (!url.length()) url = "http://monoxide-divinity-dividable.ngrok-free.dev";
+  if (!url.length()) url = "https://miniboy-store.shares.zrok.io";
 
   if (!runKeyboard("Store URL", url, false)) return;
 
@@ -2623,6 +2847,370 @@ void editStoreUrl() {
   waitAnyKey();
 }
 
+void heartbeatTask(void* pv);
+void startHeartbeatTask() {
+  static bool started = false;
+  if (started) return;
+  started = true;
+  xTaskCreate(heartbeatTask, "hb", 32768, NULL, 1, NULL);
+}
+
+void showProcessMonitor() {
+  waitRelease();
+  int sel = 0;
+  while (true) {
+    uint32_t t0 = millis();
+    pollButtons();
+    if (evTap[BI_BACK] || evLong[BI_BACK]) return;
+
+    struct PR { const char* n; String v; uint8_t action; };
+    PR rows[9];
+    int n = 0;
+    rows[n++] = { "WiFi", (WiFi.status()==WL_CONNECTED) ? ("UP "+String(WiFi.RSSI())) : String("OFF"), 1 };
+    rows[n++] = { "SD card", sdReady ? String("READY") : String("MISSING"), 2 };
+    rows[n++] = { "Web server", "PORT 80", 0 };
+    rows[n++] = { "Heartbeat task", heartbeatTaskHandle ? String("RUNNING") : String("STOPPED"), 3 };
+    rows[n++] = { "FreeRTOS tasks", String(uxTaskGetNumberOfTasks()), 0 };
+    rows[n++] = { "RTC clock", rtcPresent ? String("PRESENT") : String("ABSENT"), 4 };
+    rows[n++] = { "Audio", musicPlaying ? String("MUSIC") : (sfxOn ? String("SFX") : String("IDLE")), 5 };
+    rows[n++] = { "Music theme", String(THEME_NAMES[cfg.musicTheme%THEME_COUNT]), 6 };
+    rows[n++] = { "Free heap", String(ESP.getFreeHeap()/1024)+" KB", 0 };
+
+    if (nav(BI_UP)) sel = (sel+n-1)%n;
+    if (nav(BI_DOWN)) sel = (sel+1)%n;
+    if (evDown[BI_OK]) {
+      switch (rows[sel].action) {
+        case 1:
+          if (WiFi.status()==WL_CONNECTED) WiFi.disconnect(false);
+          else reconnectSaved();
+          break;
+        case 2:
+          showScreen("SD", sdReady?"Ready":"Missing","","BACK");
+          waitAnyKey();
+          break;
+        case 3:
+          if (heartbeatTaskHandle) {
+            TaskHandle_t task = heartbeatTaskHandle;
+            heartbeatTaskHandle = nullptr;
+            vTaskDelete(task);
+          } else {
+            startHeartbeatTask();
+          }
+          break;
+        case 4:
+          rtcSetSystemClock();
+          showScreen("RTC","Resync","","BACK");
+          waitAnyKey();
+          break;
+        case 5:
+          audioStop();
+          showScreen("Audio","Stopped","","BACK");
+          waitAnyKey();
+          break;
+        case 6:
+          cfg.musicTheme=(cfg.musicTheme+1)%THEME_COUNT;
+          saveCfg();
+          break;
+      }
+      waitRelease();
+    }
+
+    oled.clearBuffer();
+    oled.setFont(uiFontLarge());
+    oled.drawUTF8(0,12,"System Monitor");
+    oled.drawHLine(0,16,128);
+    oled.setFont(uiFontSmall());
+    int top = max(0, min(sel-2, n-5));
+    for (int i=0; i<5 && top+i<n; i++) {
+      int idx=top+i, y=26+i*7;
+      if (idx==sel) {
+        oled.drawRBox(0,y-6,128,8,2);
+        oled.setDrawColor(0);
+      }
+      oled.drawUTF8(2,y,rows[idx].n);
+      String v = rows[idx].v;
+      if (v.length()>12) v=v.substring(0,12);
+      oled.drawUTF8(126-oled.getUTF8Width(v.c_str()),y,v.c_str());
+      if (idx==sel) oled.setDrawColor(1);
+    }
+    oled.drawUTF8(0,63,"OK: action  BACK: exit");
+    present();
+    frameWait(t0);
+  }
+}
+
+void scanLoadedLangs() {
+  uint8_t count = 3;
+  if (sdReady && SD.exists("/lang-de.json")) count = 4;
+  cfg.langCount = count;
+  prefs.putUChar("langcount", cfg.langCount);
+}
+void drawPinScreen(int curR, int curC) {
+  oled.clearBuffer();
+  oled.setFont(u8g2_font_6x13_t_cyrillic);
+  oled.drawStr(0, 11, "PIN");
+  oled.setFont(u8g2_font_5x8_t_cyrillic);
+  String mask = "";
+  for (uint8_t i = 0; i < g_pinBuffer.length(); i++) mask += "*";
+  if (mask.length() > 11) mask = mask.substring(mask.length() - 11);
+  oled.drawStr(126 - oled.getStrWidth(mask.c_str()), 11, mask.c_str());
+  oled.drawHLine(0, 13, 128);
+  const char* labels[4][3] = {
+    {"1","2","3"},
+    {"4","5","6"},
+    {"7","8","9"},
+    {"DEL","0","OK"}
+  };
+  int cellW = 28, cellH = 8, gap = 1;
+  int gridW = 3 * cellW + 2 * gap;
+  int x0 = (128 - gridW) / 2;
+  int y0 = 18;
+  oled.setFont(u8g2_font_5x8_t_cyrillic);
+  for (int r = 0; r < 4; r++) {
+    for (int col = 0; col < 3; col++) {
+      int x = x0 + col * (cellW + gap);
+      int y = y0 + r * (cellH + gap);
+      const char* lbl = labels[r][col];
+      int lw = oled.getStrWidth(lbl);
+      if (r == curR && col == curC) {
+        oled.drawRBox(x, y, cellW, cellH, 2);
+        oled.setDrawColor(0);
+        oled.drawStr(x + (cellW - lw) / 2, y + cellH - 1, lbl);
+        oled.setDrawColor(1);
+      } else {
+        oled.drawFrame(x, y, cellW, cellH);
+        oled.drawStr(x + (cellW - lw) / 2, y + cellH - 1, lbl);
+      }
+    }
+  }
+  oled.drawStr(0, 63, "OK:enter BACK:clear");
+  present();
+}
+
+void runLockScreen() {
+  g_pinBuffer = "";
+  int curR = 0, curC = 0;
+  waitRelease();
+  while (true) {
+    uint32_t t0 = millis();
+    pollButtons();
+    if (nav(BI_UP)) curR = (curR + 3) % 4;
+    if (nav(BI_DOWN)) curR = (curR + 1) % 4;
+    if (nav(BI_LEFT)) curC = (curC + 2) % 3;
+    if (nav(BI_RIGHT)) curC = (curC + 1) % 3;
+    if (evDown[BI_BACK]) { g_pinBuffer = ""; SFX(SF_CLICK); }
+    if (evDown[BI_OK]) {
+      if (curR == 3 && curC == 0) {
+        if (g_pinBuffer.length() > 0) g_pinBuffer.remove(g_pinBuffer.length() - 1);
+        SFX(SF_CLICK);
+      } else if (curR == 3 && curC == 2) {
+        if (g_pinBuffer == g_pinCode) { g_pinBuffer = ""; SFX(SF_WIN); waitRelease(); return; }
+        else { SFX(SF_DIE); g_pinBuffer = ""; }
+      } else {
+        char d = '0';
+        if (curR < 3) d = '1' + (curR * 3 + curC);
+        else if (curR == 3 && curC == 1) d = '0';
+        if (g_pinBuffer.length() < 12) { g_pinBuffer += d; SFX(SF_CLICK); }
+      }
+    }
+    drawPinScreen(curR, curC);
+    frameWait(t0);
+  }
+}
+
+void runLockSettings() {
+  waitRelease();
+  int sel = 0;
+  const int N = 4;
+  while (true) {
+    uint32_t t0 = millis();
+    pollButtons();
+    if (evTap[BI_BACK] || evLong[BI_BACK]) return;
+    if (nav(BI_UP)) sel = (sel + N - 1) % N;
+    if (nav(BI_DOWN)) sel = (sel + 1) % N;
+    if (evDown[BI_LEFT] || evDown[BI_RIGHT]) {
+      if (sel == 0) { g_pinEnabled = !g_pinEnabled; saveCfg(); SFX(SF_CLICK); }
+    }
+    if (evDown[BI_OK]) {
+      if (sel == 0) { g_pinEnabled = !g_pinEnabled; saveCfg(); SFX(SF_CLICK); }
+      else if (sel == 1) {
+        String newPin = "";
+        if (runKeyboard("New PIN (4-12 digits)", newPin, true)) {
+          newPin.trim();
+          bool ok = newPin.length() >= 4 && newPin.length() <= 12;
+          for (uint8_t i = 0; ok && i < newPin.length(); i++) {
+            if (newPin[i] < '0' || newPin[i] > '9') ok = false;
+          }
+          if (ok) {
+            g_pinCode = newPin;
+            g_pinEnabled = true;
+            saveCfg();
+            showScreen("PIN saved", "Length: " + String(newPin.length()), "Lock screen ON");
+            waitAnyKey();
+          } else {
+            showScreen("Invalid PIN", "Must be 4-12 digits", "");
+            waitAnyKey();
+          }
+        }
+      } else if (sel == 2) {
+        if (g_pinEnabled && g_pinCode.length() > 0) {
+          runLockScreen();
+          showScreen("Unlocked", "PIN correct", "");
+          waitAnyKey();
+        } else {
+          showScreen("Lock screen", "Enable and set PIN first", "");
+          waitAnyKey();
+        }
+      } else return;
+    }
+    oled.clearBuffer();
+    oled.setFont(u8g2_font_6x13_t_cyrillic);
+    oled.drawStr(0, 12, "Screen Lock");
+    oled.drawHLine(0, 16, 128);
+    oled.setFont(u8g2_font_5x8_t_cyrillic);
+    const char* labels[4] = {
+      g_pinEnabled ? "Enable: ON" : "Enable: OFF",
+      "Change PIN",
+      "Test lock screen",
+      "Back"
+    };
+    for (int i = 0; i < N; i++) {
+      int y = 26 + i * 9;
+      if (i == sel) { oled.drawRBox(0, y - 7, 128, 9, 2); oled.setDrawColor(0); }
+      oled.drawStr(4, y, labels[i]);
+      if (i == sel) oled.setDrawColor(1);
+    }
+    present();
+    frameWait(t0);
+  }
+}
+void saveSettingsToSD() {
+  if (!sdReady) { showScreen("Save SD", "No SD card", ""); waitAnyKey(); return; }
+  JsonDocument d;
+  JsonObject s = d["settings"].to<JsonObject>();
+  s["bright"] = cfg.bright; s["invert"] = cfg.invert; s["showPass"] = cfg.showPass;
+  s["layout"] = cfg.layout; s["rep"] = cfg.rep; s["showFps"] = cfg.showFps;
+  s["autoConn"] = cfg.autoConn; s["sfx"] = cfg.sfx;
+  s["musicTheme"] = cfg.musicTheme; s["volPercent"] = cfg.volPercent;
+  s["difficulty"] = cfg.difficulty; s["animSpeed"] = cfg.animSpeed;
+  s["showClock"] = cfg.showClock; s["clock24h"] = cfg.clock24h;
+  s["autoTime"] = cfg.autoTime; s["lang"] = cfg.lang;
+  s["showFileTypes"] = cfg.showFileTypes; s["settingsWrap"] = cfg.settingsWrap;
+  s["langCount"] = cfg.langCount;
+  s["btnUp"] = cfg.btnGpioUp; s["btnDown"] = cfg.btnGpioDown;
+  s["btnLeft"] = cfg.btnGpioLeft; s["btnRight"] = cfg.btnGpioRight;
+  s["btnOk"] = cfg.btnGpioOk; s["btnBack"] = cfg.btnGpioBack;
+  d["wifi"]["ssid"] = prefs.getString("ssid", "");
+  d["wifi"]["pass"] = prefs.getString("pass", "");
+  d["store_url"] = prefs.getString("store_url", "");
+  d["pin"]["enabled"] = g_pinEnabled;
+  d["pin"]["code"] = g_pinCode;
+  JsonArray gd = d["appDifficulty"].to<JsonArray>();
+  for (int i = 0; i < APP_COUNT; i++) gd.add(appDifficulty[i]);
+  JsonArray best = d["best"].to<JsonArray>();
+  for (int i = 0; i < REC_N; i++) { char k[8]; snprintf(k, sizeof(k), "b%d", i); best.add(prefs.getInt(k, 0)); }
+  File f = SD.open("/config.json", FILE_WRITE);
+  if (!f) { showScreen("Save SD", "Cannot open", "/config.json"); waitAnyKey(); return; }
+  serializeJson(d, f);
+  f.close();
+  showScreen("Saved to SD", "/config.json", String(ESP.getFreeHeap()/1024) + "K free");
+  waitAnyKey();
+}
+
+void loadSettingsFromSD() {
+  if (!sdReady) { showScreen("Load SD", "No SD card", ""); waitAnyKey(); return; }
+  if (!SD.exists("/config.json")) { showScreen("Load SD", "Not found", "/config.json"); waitAnyKey(); return; }
+  if (!confirmBox("Load settings?", "Overwrites current", "")) return;
+  File f = SD.open("/config.json", FILE_READ);
+  if (!f) { showScreen("Load SD", "Cannot open", ""); waitAnyKey(); return; }
+  JsonDocument d;
+  DeserializationError err = deserializeJson(d, f);
+  f.close();
+  if (err) { showScreen("Load SD", "Bad JSON", err.c_str()); waitAnyKey(); return; }
+  JsonObject s = d["settings"];
+  if (!s.isNull()) {
+    cfg.bright = s["bright"] | cfg.bright;
+    cfg.invert = s["invert"] | cfg.invert;
+    cfg.showPass = s["showPass"] | cfg.showPass;
+    cfg.layout = s["layout"] | cfg.layout;
+    cfg.rep = s["rep"] | cfg.rep;
+    cfg.showFps = s["showFps"] | cfg.showFps;
+    cfg.autoConn = s["autoConn"] | cfg.autoConn;
+    cfg.sfx = s["sfx"] | cfg.sfx;
+    cfg.musicTheme = s["musicTheme"] | cfg.musicTheme;
+    cfg.volPercent = s["volPercent"] | cfg.volPercent;
+    cfg.difficulty = s["difficulty"] | cfg.difficulty;
+    cfg.animSpeed = s["animSpeed"] | cfg.animSpeed;
+    cfg.showClock = s["showClock"] | cfg.showClock;
+    cfg.clock24h = s["clock24h"] | cfg.clock24h;
+    cfg.autoTime = s["autoTime"] | cfg.autoTime;
+    cfg.lang = s["lang"] | cfg.lang;
+    cfg.showFileTypes = s["showFileTypes"] | cfg.showFileTypes;
+    cfg.settingsWrap = s["settingsWrap"] | cfg.settingsWrap;
+    cfg.langCount = s["langCount"] | cfg.langCount;
+    cfg.btnGpioUp = s["btnUp"] | cfg.btnGpioUp;
+    cfg.btnGpioDown = s["btnDown"] | cfg.btnGpioDown;
+    cfg.btnGpioLeft = s["btnLeft"] | cfg.btnGpioLeft;
+    cfg.btnGpioRight = s["btnRight"] | cfg.btnGpioRight;
+    cfg.btnGpioOk = s["btnOk"] | cfg.btnGpioOk;
+    cfg.btnGpioBack = s["btnBack"] | cfg.btnGpioBack;
+  }
+  const char* ssid = d["wifi"]["ssid"] | "";
+  const char* pass = d["wifi"]["pass"] | "";
+  if (strlen(ssid) > 0) { prefs.putString("ssid", ssid); prefs.putString("pass", pass); }
+  const char* su = d["store_url"] | "";
+  if (strlen(su) > 0) prefs.putString("store_url", su);
+  g_pinEnabled = d["pin"]["enabled"] | g_pinEnabled;
+  const char* pc = d["pin"]["code"] | "";
+  if (strlen(pc) > 0) g_pinCode = pc;
+  JsonArray gd = d["appDifficulty"];
+  for (int i = 0; i < APP_COUNT && i < (int)gd.size(); i++) {
+    appDifficulty[i] = gd[i] | appDifficulty[i];
+    char k[8]; snprintf(k, sizeof(k), "gd%02d", i); prefs.putUChar(k, appDifficulty[i]);
+  }
+  JsonArray best = d["best"];
+  for (int i = 0; i < REC_N && i < (int)best.size(); i++) {
+    int v = best[i] | 0;
+    if (v > 0) { char k[8]; snprintf(k, sizeof(k), "b%d", i); prefs.putInt(k, v); }
+  }
+  saveCfg();
+  applyDisplay();
+  showScreen("Loaded from SD", "/config.json", "Reboot recommended");
+  waitAnyKey();
+}
+void runAppOrderEditor() {
+  waitRelease();
+  int sel = 0;
+  const int TOTAL = APP_COUNT + 1;
+  while (true) {
+    uint32_t t0 = millis(); pollButtons();
+    if (evTap[BI_BACK] || evLong[BI_BACK]) { saveCfg(); showScreen("App order", "Saved", "", "OK"); waitAnyKey(); return; }
+    if (nav(BI_LEFT)) sel = (sel + TOTAL - 1) % TOTAL;
+    if (nav(BI_RIGHT)) sel = (sel + 1) % TOTAL;
+    if (nav(BI_UP) && sel > 0) { uint8_t t = appOrder[sel]; appOrder[sel] = appOrder[sel-1]; appOrder[sel-1] = t; sel--; SFX(SF_MOVE); }
+    if (nav(BI_DOWN) && sel < TOTAL - 1) { uint8_t t = appOrder[sel]; appOrder[sel] = appOrder[sel+1]; appOrder[sel+1] = t; sel++; SFX(SF_MOVE); }
+    if (evDown[BI_OK]) { for (int i = 0; i <= APP_COUNT; i++) appOrder[i] = i; saveCfg(); SFX(SF_CLICK); showScreen("App order", "Reset to default", "", "OK"); waitAnyKey(); return; }
+    oled.clearBuffer();
+    oled.setFont(u8g2_font_6x13_t_cyrillic);
+    oled.drawStr(0, 12, "App order");
+    oled.drawHLine(0, 16, 128);
+    oled.setFont(u8g2_font_5x8_t_cyrillic);
+    int top = max(0, min(sel - 2, TOTAL - 5));
+    for (int i = 0; i < 5 && top + i < TOTAL; i++) {
+      int idx = top + i;
+      int appId = appOrder[idx];
+      int y = 27 + i * 7;
+      if (idx == sel) { oled.drawRBox(0, y - 6, 128, 8, 2); oled.setDrawColor(0); }
+      String nm = String(idx + 1) + "." + String(appName(appId));
+      if (nm.length() > 21) nm = nm.substring(0, 21);
+      oled.drawStr(2, y, nm.c_str());
+      if (idx == sel) oled.setDrawColor(1);
+    }
+    oled.drawStr(0, 63, "UP/DN move OK reset");
+    present();
+    frameWait(t0);
+  }
+}
 void runSettings() {
   waitRelease();
   int sel=0, top=0;
@@ -2651,32 +3239,43 @@ void runSettings() {
         case 24: showScreen("SD card status", sdReady?"SD ready":"SD not detected", "Wi-Fi: MINI-BOY-FILES", "192.168.4.1"); waitAnyKey(); break;
         case 25: bootLogoFromSD = !bootLogoFromSD; prefs.putBool("bootlogo_sd", bootLogoFromSD); showScreen("Boot logo", bootLogoFromSD?"SD: /bootlogo.raw":"Default MINI-BOY", bootLogoFromSD && (!sdReady || !SD.exists("/bootlogo.raw"))?"File missing":"Saved", "Restart to apply"); waitAnyKey(); break;
         case 26: cfg.showFileTypes = !cfg.showFileTypes; prefs.putBool("showft", cfg.showFileTypes); break;
-        case 27: cfg.settingsWrap = !cfg.settingsWrap; prefs.putBool("setwrap", cfg.settingsWrap); break;
+        case 27: cfg.settingsWrap = !cfg.settingsWrap; prefs.putBool("setwrap", cfg.settingsWrap);
+  prefs.putBytes("appord", appOrder, sizeof(appOrder));
+  prefs.putBool("pin_en", g_pinEnabled);
+  prefs.putString("pin_code", g_pinCode);
+  prefs.putUChar("langcount", cfg.langCount);
+  prefs.putUChar("langcount", cfg.langCount); break;
         case 28: runButtonCalibration(); break;        // Адаптивная калибровка
         case 29: resetButtonCalibration(); break;      // Сброс только кнопок
         case 30: runFactoryReset(); break;             // Сброс ВСЕГО с подтверждением
         case 31: runSdFirmwareUpdate(); break;    
         case 32: runStore(); break;
         case 33: editStoreUrl(); waitRelease(); break;
-        case 34: return;                    
+        case 35: showProcessMonitor(); waitRelease(); break;
+        case 37: runLockSettings(); break;
+        case 38: saveSettingsToSD(); break;
+        case 39: loadSettingsFromSD(); break;
+        case 40: runAppOrderEditor(); break;
+        case 41: runStoreCatalog(); break;
+        case 42: return;
         default: setToggle(sel); break;
       }
       if (sel<=2 || sel>=13) waitRelease();
       continue;
     }
     oled.clearBuffer();
-    oled.setFont(u8g2_font_6x13_t_cyrillic);
+    oled.setFont(uiFontLarge());
     oled.drawUTF8(0,12,"Settings");
     drawWifiStatus(116,2);
     oled.drawHLine(0,16,128);
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
+    oled.setFont(uiFontSmall());
     for (int i=0;i<ROWS;i++) {
       int idx = top+i; if (idx>=SET_N) break;
       int y = 25+i*9;
       if (idx==sel) { oled.drawRBox(0,y-7,128,9,2); oled.setDrawColor(0); }
-      oled.drawStr(4,y,SET_NAMES[idx]);
+      oled.drawUTF8(4,y,setName(idx));
       String v = setValue(idx);
-      if (v.length()) oled.drawStr(124-oled.getStrWidth(v.c_str()),y,v.c_str());
+      if (v.length()) oled.drawUTF8(124-oled.getUTF8Width(v.c_str()),y,v.c_str());
       oled.setDrawColor(1);
     }
     present(); frameWait(t0);
@@ -2831,11 +3430,11 @@ void runDino() {
     bool wantInv = (night!=flash)!=base;
     if (wantInv!=lastInv) { oled.sendF("c",wantInv?0xA7:0xA6); lastInv=wantInv; }
     oled.clearBuffer();
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
+    oled.setFont(uiFontSmall());
     String hi = "HI "+padNum(best,5);
     String sc = padNum((int)score,5);
-    oled.drawStr(0,7,hi.c_str());
-    oled.drawStr(128-oled.getStrWidth(sc.c_str()),7,sc.c_str());
+    oled.drawUTF8(0,7,hi.c_str());
+    oled.drawUTF8(128-oled.getUTF8Width(sc.c_str()),7,sc.c_str());
     drawCloud((int)cloudX[0],16); drawCloud((int)cloudX[1],24);
     oled.drawHLine(0,GROUND_Y+1,128);
     for (int i=0;i<10;i++) {
@@ -2904,11 +3503,11 @@ void runFlappy() {
     oled.drawHLine(0,GROUND_Y,128);
     for (int x=-((int)scroll%6);x<128;x+=6) oled.drawLine(x,63,x+4,59);
     oled.setDrawColor(0); oled.drawBox(0,0,128,9); oled.setDrawColor(1);
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
+    oled.setFont(uiFontSmall());
     String hi = "BEST "+padNum(best,3);
     String sc = padNum(score,3);
-    oled.drawStr(2,7,hi.c_str());
-    oled.drawStr(126-oled.getStrWidth(sc.c_str()),7,sc.c_str());
+    oled.drawUTF8(2,7,hi.c_str());
+    oled.drawUTF8(126-oled.getUTF8Width(sc.c_str()),7,sc.c_str());
     if (dead && millis()-deadAt>300)
       overlayBox("GAME OVER", ("Score "+String(score)).c_str());
     present(); frameWait(t0);
@@ -3020,15 +3619,15 @@ int tetrisClearLines() {
 }
 void tetrisDrawGameOver(int score, int best) {
   oled.clearBuffer();
-  oled.setFont(u8g2_font_6x13_t_cyrillic);
-  oled.drawStr(20,16,"GAME OVER");
+  oled.setFont(uiFontLarge());
+  oled.drawUTF8(20,16,"GAME OVER");
   oled.drawHLine(4,21,120);
-  oled.setFont(u8g2_font_5x8_t_cyrillic);
+  oled.setFont(uiFontSmall());
   String scoreLine = "SCORE "+String(score);
   String bestLine = "BEST  "+String(best);
-  oled.drawStr(18,34,scoreLine.c_str());
-  oled.drawStr(18,44,bestLine.c_str());
-  oled.drawStr(2,58,"OK: AGAIN  BACK: EXIT");
+  oled.drawUTF8(18,34,scoreLine.c_str());
+  oled.drawUTF8(18,44,bestLine.c_str());
+  oled.drawUTF8(2,58,"OK: AGAIN  BACK: EXIT");
   present();
 }
 void runTetris() {
@@ -3092,14 +3691,14 @@ void runTetris() {
     }
     oled.clearBuffer();
     oled.drawFrame(0,0,39,63);
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
-    oled.drawStr(45,8,"TETRIS");
+    oled.setFont(uiFontSmall());
+    oled.drawUTF8(45,8,"TETRIS");
     oled.drawHLine(43,11,82);
-    oled.drawStr(45,22,("SCORE "+String(score)).c_str());
-    oled.drawStr(45,32,("LEVEL "+String(level)).c_str());
-    oled.drawStr(45,42,("BEST  "+String(best)).c_str());
-    oled.drawStr(45,53,"UP/OK ROT");
-    oled.drawStr(45,62,"DN DROP");
+    oled.drawUTF8(45,22,("SCORE "+String(score)).c_str());
+    oled.drawUTF8(45,32,("LEVEL "+String(level)).c_str());
+    oled.drawUTF8(45,42,("BEST  "+String(best)).c_str());
+    oled.drawUTF8(45,53,"UP/OK ROT");
+    oled.drawUTF8(45,62,"DN DROP");
     tetrisDrawBoard(); tetrisDrawPiece(cur);
     present(); frameWait(t0);
   }
@@ -3159,8 +3758,8 @@ void runSnake() {
       else oled.drawBox(px,py,cs-1,cs-1);
     }
     oled.drawDisc(cx+foodX*cs+(cs/2), cy+foodY*cs+(cs/2), 2);
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
-    oled.drawStr(2,62,("S "+String(score)+" HI "+String(best)).c_str());
+    oled.setFont(uiFontSmall());
+    oled.drawUTF8(2,62,("S "+String(score)+" HI "+String(best)).c_str());
     present(); frameWait(t0);
   }
 }
@@ -3203,8 +3802,8 @@ void runPong() {
     oled.drawBox(2,paddleL,PW,PH);
     oled.drawBox(124,paddleR,PW,PH);
     oled.drawDisc((int)ballX,(int)ballY,1);
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
-    oled.drawStr(2,62,(String(scoreL)+" : "+String(scoreR)).c_str());
+    oled.setFont(uiFontSmall());
+    oled.drawUTF8(2,62,(String(scoreL)+" : "+String(scoreR)).c_str());
     present(); frameWait(t0);
   }
 }
@@ -3275,8 +3874,8 @@ void runBreak() {
     }
     oled.drawRBox(paddleX,54,PW,PH,2);
     oled.drawDisc((int)bx,(int)by,2);
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
-    oled.drawStr(2,62,("S "+String(score)+" HI "+String(best)).c_str());
+    oled.setFont(uiFontSmall());
+    oled.drawUTF8(2,62,("S "+String(score)+" HI "+String(best)).c_str());
     present(); frameWait(t0);
   }
 }
@@ -3319,8 +3918,8 @@ void runInvade() {
     for (int i=0;i<N;i++) if (alive[i]) oled.drawBox((int)ex[i],ey[i],8,4);
     oled.drawRBox((int)shipX-4,54,8,4,2);
     if (shotX>=0) oled.drawBox((int)shotX,(int)shotY,2,4);
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
-    oled.drawStr(2,62,("S "+String(score)+" HI "+String(best)).c_str());
+    oled.setFont(uiFontSmall());
+    oled.drawUTF8(2,62,("S "+String(score)+" HI "+String(best)).c_str());
     present(); frameWait(t0);
   }
 }
@@ -3405,8 +4004,8 @@ void runAster() {
                   tx+(int)(3*cos(sa+1.57)), ty+(int)(3*sin(sa+1.57)));
     for (int i=0;i<MAXA;i++) if (ast[i].on) oled.drawCircle((int)ast[i].x,(int)ast[i].y,ast[i].sz);
     if (shotX>=0) oled.drawBox((int)shotX,(int)shotY,2,2);
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
-    oled.drawStr(2,62,("S "+String(score)+" L"+String(lives)+" HI "+String(best)).c_str());
+    oled.setFont(uiFontSmall());
+    oled.drawUTF8(2,62,("S "+String(score)+" L"+String(lives)+" HI "+String(best)).c_str());
     present(); frameWait(t0);
   }
 }
@@ -3476,14 +4075,14 @@ void runMines() {
         if (cur==y*W+x) oled.drawRBox(px,py,12,6,2);
       } else if (state[y][x]==9) {
         oled.drawRBox(px,py,12,6,2);
-        oled.setDrawColor(0); oled.drawStr(px+4,py+4,"F"); oled.setDrawColor(1);
+        oled.setDrawColor(0); oled.drawUTF8(px+4,py+4,"F"); oled.setDrawColor(1);
       } else {
         oled.drawBox(px,py,12,6);
-        if (state[y][x]>0) { oled.setDrawColor(0); oled.drawStr(px+4,py+5,String(state[y][x]).c_str()); oled.setDrawColor(1); }
+        if (state[y][x]>0) { oled.setDrawColor(0); oled.drawUTF8(px+4,py+5,String(state[y][x]).c_str()); oled.setDrawColor(1); }
       }
     }
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
-    oled.drawStr(2,62,("FOUND "+String(score)+" HI "+String(best)).c_str());
+    oled.setFont(uiFontSmall());
+    oled.drawUTF8(2,62,("FOUND "+String(score)+" HI "+String(best)).c_str());
     present(); frameWait(t0);
   }
 }
@@ -3573,16 +4172,16 @@ void run2048() {
       int px=8+c*28, py=6+r*12;
       if (grid[r][c]) {
         oled.drawRBox(px,py,24,10,3);
-        oled.setFont(u8g2_font_6x13_tr);
+        oled.setFont(uiFontLarge());
         String s = String(grid[r][c]);
-        oled.drawStr(px+(24-oled.getStrWidth(s.c_str()))/2, py+8, s.c_str());
-        oled.setFont(u8g2_font_5x8_t_cyrillic);
+        oled.drawUTF8(px+(24-oled.getUTF8Width(s.c_str()))/2, py+8, s.c_str());
+        oled.setFont(uiFontSmall());
       } else oled.drawFrame(px,py,24,10);
     }
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
-    oled.drawStr(2,62,("S "+String(score)+" HI "+String(best)).c_str());
+    oled.setFont(uiFontSmall());
+    oled.drawUTF8(2,62,("S "+String(score)+" HI "+String(best)).c_str());
     oled.drawFrame(104,0,22,8); oled.setFont(u8g2_font_4x6_tr);
-    oled.drawStr(106,6,String(nextTile).c_str());
+    oled.drawUTF8(106,6,String(nextTile).c_str());
     present(); frameWait(t0);
   }
 }
@@ -3635,9 +4234,9 @@ void runSimon() {
       }
     }
     oled.clearBuffer();
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
-    oled.drawStr(2,8,"SIMON");
-    oled.drawStr(2,62,("S "+String(score)+" HI "+String(best)).c_str());
+    oled.setFont(uiFontSmall());
+    oled.drawUTF8(2,8,"SIMON");
+    oled.drawUTF8(2,62,("S "+String(score)+" HI "+String(best)).c_str());
     oled.drawRFrame(10,10,48,22,2); oled.drawRFrame(70,10,48,22,2);
     oled.drawRFrame(10,36,48,22,2); oled.drawRFrame(70,36,48,22,2);
     present(); frameWait(t0);
@@ -3756,8 +4355,8 @@ void runFrogger() {
     // Целевая линия сверху
     oled.drawHLine(0, 8, 128);
 
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
-    oled.drawStr(0, 63, ("S "+String(score)+" L"+String(lives)+" HI "+String(best)).c_str());
+    oled.setFont(uiFontSmall());
+    oled.drawUTF8(0, 63, ("S "+String(score)+" L"+String(lives)+" HI "+String(best)).c_str());
 
     if (dead) {
       overlayBox(lives<=0?"GAME OVER":"HIT!",
@@ -3893,8 +4492,8 @@ void runTTT() {
         oled.drawFrame(x-1,y-1,32,14);
       }
     }
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
-    oled.drawStr(0,62,("WINS "+String(gamesWon)+" HI "+String(best)).c_str());
+    oled.setFont(uiFontSmall());
+    oled.drawUTF8(0,62,("WINS "+String(gamesWon)+" HI "+String(best)).c_str());
     present(); frameWait(t0);
   }
 }
@@ -3989,8 +4588,8 @@ void runSnakeMaze() {
     oled.drawPixel(foodX*CS+2,foodY*CS+2);
     for (int i=len-1;i>0;i--) oled.drawRBox(snX[i]*CS+1,snY[i]*CS+1,4,4,1);
     oled.drawDisc(snX[0]*CS+3,snY[0]*CS+3,2);
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
-    oled.drawStr(0,62,("FOOD "+String(score/10)+" HI "+String(best/10)).c_str());
+    oled.setFont(uiFontSmall());
+    oled.drawUTF8(0,62,("FOOD "+String(score/10)+" HI "+String(best/10)).c_str());
     if (dead) overlayBox("CRASHED","OK: retry / BACK: exit");
     present(); frameWait(t0);
   }
@@ -4051,15 +4650,15 @@ void runMemory() {
       if (i==cur) { oled.drawRBox(x,y,24,10,3); oled.setDrawColor(0); }
       else oled.drawFrame(x,y,24,10);
       if (open[i]||i==first||i==second) {
-        oled.setFont(u8g2_font_6x13_tr);
+        oled.setFont(uiFontLarge());
         String label = String(mem[i]+1);
-        oled.drawStr(x+9,y+8,label.c_str());
-        oled.setFont(u8g2_font_5x8_t_cyrillic);
+        oled.drawUTF8(x+9,y+8,label.c_str());
+        oled.setFont(uiFontSmall());
       }
       oled.setDrawColor(1);
     }
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
-    oled.drawStr(2,62,("PAIRS "+String(pairs)+"/8 BEST "+String(best)).c_str());
+    oled.setFont(uiFontSmall());
+    oled.drawUTF8(2,62,("PAIRS "+String(pairs)+"/8 BEST "+String(best)).c_str());
     present(); frameWait(t0);
   }
 }
@@ -4111,9 +4710,9 @@ void runSkater() {
       if (obX[i]<130 && obX[i]>-20) oled.drawRBox((int)obX[i],36,10,8,2);
     }
     oled.drawRBox((int)px,(int)py-4,10,8,2);
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
-    oled.drawStr(0,62,("SCORE "+String(score/10)+" HI "+String(best)).c_str());
-    if (!started) oled.drawStr(40,24,"JUMP!");
+    oled.setFont(uiFontSmall());
+    oled.drawUTF8(0,62,("SCORE "+String(score/10)+" HI "+String(best)).c_str());
+    if (!started) oled.drawUTF8(40,24,"JUMP!");
     if (dead) overlayBox("CRASHED!","OK: retry");
     present(); frameWait(t0);
   }
@@ -4274,9 +4873,9 @@ void runTank() {
     }
 
     oled.clearBuffer();
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
+    oled.setFont(uiFontSmall());
     char hud[32]; snprintf(hud,sizeof(hud),"S%d H%d L%d",score,lives,level);
-    oled.drawStr(0,8,hud);
+    oled.drawUTF8(0,8,hud);
     oled.drawFrame(ARENA_X,ARENA_Y,ARENA_W,ARENA_H);
     // Maze blocks are drawn with a bevel pattern to read as solid obstacles.
     for(int i=0;i<wallCount;i++) {
@@ -4363,8 +4962,8 @@ void runStars() {
       if (stars[i][2]>0) { oled.drawFrame(x-2,y-2,5,5); oled.drawPixel(x,y-2); }
       else { oled.drawPixel(x,y); oled.drawPixel(x,y+2); oled.drawPixel(x-1,y+1); oled.drawPixel(x+1,y+1); }
     }
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
-    oled.drawStr(0,8,("S "+String(score)+" L "+String(lives)+" C "+String(combo)).c_str());
+    oled.setFont(uiFontSmall());
+    oled.drawUTF8(0,8,("S "+String(score)+" L "+String(lives)+" C "+String(combo)).c_str());
     if (lives<=0) overlayBox("GAME OVER","OK retry / BACK exit");
     present(); frameWait(t0);
   }
@@ -4409,11 +5008,11 @@ void runReaction() {
         char buf[32];
         snprintf(buf,sizeof(buf),"Best: %d ms", bestMs);
         oled.clearBuffer();
-        oled.setFont(u8g2_font_6x13_t_cyrillic);
-        oled.drawStr(10,20,"RESULTS");
-        oled.setFont(u8g2_font_5x8_t_cyrillic);
-        oled.drawStr(20,40,buf);
-        oled.drawStr(20,52,"OK: restart");
+        oled.setFont(uiFontLarge());
+        oled.drawUTF8(10,20,"RESULTS");
+        oled.setFont(uiFontSmall());
+        oled.drawUTF8(20,40,buf);
+        oled.drawUTF8(20,52,"OK: restart");
         present();
         waitRelease();
         while (true) {
@@ -4436,21 +5035,21 @@ void runReaction() {
     if (falseStart && now - falseStartAt > 1200) falseStart = false;
 
     oled.clearBuffer();
-    oled.setFont(u8g2_font_6x13_t_cyrillic);
+    oled.setFont(uiFontLarge());
     if (falseStart) {
-      oled.drawStr(20,20,"FALSE START!");
-      oled.setFont(u8g2_font_5x8_t_cyrillic);
-      oled.drawStr(40,40,"Wait...");
+      oled.drawUTF8(20,20,"FALSE START!");
+      oled.setFont(uiFontSmall());
+      oled.drawUTF8(40,40,"Wait...");
     } else if (waiting) {
-      oled.drawStr(20,20,"Wait...");
+      oled.drawUTF8(20,20,"Wait...");
     } else if (ready) {
       uint32_t elapsed = now - showTime;
-      oled.drawStr(20,20,"PRESS!");
-      oled.setFont(u8g2_font_5x8_t_cyrillic);
-      oled.drawStr(40,40,(String(elapsed)+" ms").c_str());
+      oled.drawUTF8(20,20,"PRESS!");
+      oled.setFont(uiFontSmall());
+      oled.drawUTF8(40,40,(String(elapsed)+" ms").c_str());
     }
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
-    oled.drawStr(0,62,("TRIES "+String(tries)+"/5 BEST "+String(bestMs)+"ms").c_str());
+    oled.setFont(uiFontSmall());
+    oled.drawUTF8(0,62,("TRIES "+String(tries)+"/5 BEST "+String(bestMs)+"ms").c_str());
     present(); frameWait(t0);
   }
 }
@@ -4552,8 +5151,8 @@ void runLabyrinth() {
       if (maze[r][c]) oled.drawBox(4+c*7+1, 2+r*6+1, 3, 3);
     oled.drawFrame(4+(MW-1)*7+1, 2+5*6+1, 5, 5);
     oled.drawDisc(4+px*7+4, 2+py*6+4, 2);
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
-    oled.drawStr(0,62,("LV "+String(level)+" STEPS "+String(score)).c_str());
+    oled.setFont(uiFontSmall());
+    oled.drawUTF8(0,62,("LV "+String(level)+" STEPS "+String(score)).c_str());
     if (escaped) overlayBox("ESCAPED!","OK: new maze");
     present(); frameWait(t0);
   }
@@ -4642,8 +5241,8 @@ void runJumper() {
       if (py >= -3 && py <= 64) oled.drawRBox(px, py, 14, 3, 1);
     }
     oled.drawDisc((int)jx, (int)jy, 3);
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
-    oled.drawStr(0,62,("JUMPS "+String(score)+" HI "+String(best)).c_str());
+    oled.setFont(uiFontSmall());
+    oled.drawUTF8(0,62,("JUMPS "+String(score)+" HI "+String(best)).c_str());
     if (dead) overlayBox("FELL!","OK: retry");
     present(); frameWait(t0);
   }
@@ -4659,10 +5258,10 @@ void drawMenu(float cur, int frameN) {
   oled.clearBuffer();
   for (int i=0;i<8;i++)
     if (((frameN/6)+i)%5==0) oled.drawPixel(STAR_X[i],STAR_Y[i]);
-  oled.setFont(u8g2_font_5x8_t_cyrillic);
-  oled.drawStr(2,8,"MINI BOY v5.1");
+  oled.setFont(uiFontSmall());
+  oled.drawUTF8(2,8,"MINI BOY v5.1");
   String cnt = padNum(menuSel+1,2)+"/"+String(menuAppCount);
-  oled.drawStr(60,8,cnt.c_str());
+  oled.drawUTF8(60,8,cnt.c_str());
   drawWifiStatus(116,0);
   const int cy = 28;
   for (int i=0;i<menuAppCount;i++) {
@@ -4679,7 +5278,8 @@ void drawMenu(float cur, int frameN) {
     int x = cx - size/2, y = cy - size/2;
     oled.drawRFrame(x, y, size, size, 6);
     if (k < 0.5f) oled.drawRFrame(x+2, y+2, size-4, size-4, 4);
-    if (k < 0.9f) drawIcon(i, cx, cy);
+    int _rid = (i <= APP_COUNT) ? appOrder[i] : (DYNAMIC_APP_ID_BASE + (i - APP_COUNT - 1));
+    if (k < 0.9f && _rid >= 0) drawIcon(_rid, cx, cy);
   }
   // Подписи видимых боковых иконок: короткие ASCII-теги читаются даже
   // на краях дисплея, где полное название не помещается.
@@ -4693,7 +5293,8 @@ void drawMenu(float cur, int frameN) {
     if (cx<10 || cx>118) continue;
     const char* tag="APP";
     switch(i) {
-      case APP_DINO: tag="DINO"; break; case APP_FLAPPY: tag="FLAP"; break;
+      default: tag="APP"; break;
+    case APP_DINO: tag="DINO"; break; case APP_FLAPPY: tag="FLAP"; break;
       case APP_TETRIS: tag="TETR"; break; case APP_SNAKE: tag="SNAK"; break;
       case APP_PONG: tag="PONG"; break; case APP_BRICK: tag="BRK"; break;
       case APP_INVADE: tag="INV"; break; case APP_ASTER: tag="ASTR"; break;
@@ -4708,13 +5309,14 @@ void drawMenu(float cur, int frameN) {
       case APP_FILE_MANAGER: tag="FILES"; break;
       case APP_NOTES: tag="NOTE"; break;
     }
-    int tw=oled.getStrWidth(tag);
-    oled.drawStr(cx-tw/2,49,tag);
+    int tw=oled.getUTF8Width(tag);
+    oled.drawUTF8(cx-tw/2,49,tag);
   }
   // UTF-8-safe selected title: use a compact font and drawUTF8, never remove
   // arbitrary bytes from a Cyrillic string.
-  oled.setFont(u8g2_font_5x8_t_cyrillic);
-const char* name = appName(menuSel);
+  oled.setFont(uiFontSmall());
+int realMenuId = (menuSel <= APP_COUNT) ? appOrder[menuSel] : (DYNAMIC_APP_ID_BASE + (menuSel - APP_COUNT - 1));
+const char* name = appName(realMenuId);
 if (!name) name = "?";
 int nameW = oled.getUTF8Width(name);
   if(nameW<=126) oled.drawUTF8((128-nameW)/2,62,name);
@@ -6066,9 +6668,9 @@ void drawGame() {
     if(bx>-16&&bx<128&&by>-16&&by<64) drawBossPixelArt(bx,by,gBoss.animFrame);
     oled.drawFrame(80,1,46,5); oled.drawBox(81,2,(45*max(0,(int)gBoss.hp))/max(1,(int)gBoss.maxHp),3);
   }
-  oled.setFont(u8g2_font_5x8_t_cyrillic);
+  oled.setFont(uiFontSmall());
   char hud[32]; snprintf(hud,sizeof(hud),"L%u H%u C%u S%d",(unsigned)(gLevel+1),(unsigned)gPlayer.hp,(unsigned)gCoins,gScore);
-  oled.setDrawColor(0); oled.drawBox(0,0,78,9); oled.setDrawColor(1); oled.drawStr(1,7,hud);
+  oled.setDrawColor(0); oled.drawBox(0,0,78,9); oled.setDrawColor(1); oled.drawUTF8(1,7,hud);
   if(gState==PS_PAUSE) overlayBox("PAUSED","OK: continue / BACK: exit");
   else if(gState==PS_INTRO) overlayBox(LEVELS[gLevel].name,"OK: start; L/R move");
   else if(gState==PS_DEAD) overlayBox("OUCH!","OK: retry / BACK: exit");
@@ -6161,10 +6763,10 @@ void runAppOptions(int id) {
       waitRelease();
     }
     oled.clearBuffer();
-    oled.setFont(u8g2_font_6x13_t_cyrillic);
+    oled.setFont(uiFontLarge());
     String title=String(appName(id)); if(title.length()>15) title=title.substring(0,15);
-    oled.drawStr(0,12,title.c_str()); oled.drawHLine(0,16,128);
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
+    oled.drawUTF8(0,12,title.c_str()); oled.drawHLine(0,16,128);
+    oled.setFont(uiFontSmall());
     for (int row=0;row<count;row++) {
       int y=27+row*9; String label, value;
       if(row==0) { label="Difficulty"; uint8_t d=difficultyFor(id); value=d==0?"EASY":d==1?"NORMAL":"HARD"; }
@@ -6173,10 +6775,10 @@ void runAppOptions(int id) {
       else if(id==APP_FLAPPY && row==1) { label="Pipe gap"; value=String(flappyGap); }
       else { label="Close options"; value="OK"; }
       if(row==sel) { oled.drawBox(0,y-7,128,9); oled.setDrawColor(0); }
-      oled.drawStr(3,y,label.c_str()); oled.drawStr(94,y,value.c_str());
+      oled.drawUTF8(3,y,label.c_str()); oled.drawUTF8(94,y,value.c_str());
       if(row==sel) oled.setDrawColor(1);
     }
-    oled.drawStr(0,62,"UP/DN select L/R edit");
+    oled.drawUTF8(0,62,"UP/DN select L/R edit");
     present(); frameWait(t0);
   }
   waitRelease(); insideAppOptions=wasInside;
@@ -6207,14 +6809,14 @@ String fmEditName(const String& title, String initial) {
     if (held(BI_OK) && heldMs(BI_OK) >= 1500 && !bst[BI_OK].longDone) {
       bst[BI_OK].longDone = true; save = true; waitRelease(); break;
     }
-    oled.clearBuffer(); oled.setFont(u8g2_font_5x8_t_cyrillic);
-    oled.drawStr(0,8,title.c_str()); oled.drawHLine(0,11,128);
+    oled.clearBuffer(); oled.setFont(uiFontSmall());
+    oled.drawUTF8(0,8,title.c_str()); oled.drawHLine(0,11,128);
     String shown=value; if(shown.length()>20) shown=shown.substring(max(0,cursor-18), min((int)value.length(), max(0,cursor-18)+20));
-    oled.drawStr(0,27,shown.c_str());
+    oled.drawUTF8(0,27,shown.c_str());
     String charLine = String("Char: [") + alphabet[charIndex] + "]";
-    oled.drawStr(0,40,charLine.c_str());
-    oled.drawStr(0,52,"UP/DN char  L/R pos");
-    oled.drawStr(0,63,"OK add  hold OK save"); present(); serviceFileWeb(); frameWait(t0);
+    oled.drawUTF8(0,40,charLine.c_str());
+    oled.drawUTF8(0,52,"UP/DN char  L/R pos");
+    oled.drawUTF8(0,63,"OK add  hold OK save"); present(); serviceFileWeb(); frameWait(t0);
   }
   if (!save) return String();
   value.trim();
@@ -6265,7 +6867,7 @@ void fmPreviewFileOnDevice(const String& filePath, const String& fileName) {
   }
   if(low.endsWith(".txt")||low.endsWith(".ino")||low.endsWith(".h")||low.endsWith(".cpp")||low.endsWith(".json")||low.endsWith(".cfg")) {
     File f=SD.open(filePath,FILE_READ);String preview;preview.reserve(800);if(f){while(f.available()&&preview.length()<800)preview+=(char)f.read();f.close();}
-    int pos=0;while(true){uint32_t t0=millis();pollButtons();if(evTap[BI_BACK]||evLong[BI_BACK])break;oled.clearBuffer();oled.setFont(u8g2_font_5x8_t_cyrillic);String title=fileName;if(title.length()>20)title=title.substring(0,20);oled.drawStr(0,8,title.c_str());oled.drawHLine(0,11,128);int cur=pos;for(int r=0;r<6;r++){int e=preview.indexOf('\n',cur);if(e<0)e=preview.length();String ln=preview.substring(cur,e);if(ln.length()>21)ln=ln.substring(0,21);oled.drawStr(0,21+r*7,ln.c_str());cur=e<(int)preview.length()?e+1:e;}present();if(nav(BI_DOWN)||evTap[BI_OK])pos=cur>=(int)preview.length()?0:cur;if(nav(BI_UP))pos=max(0,pos-180);serviceFileWeb();frameWait(t0);}waitRelease();return;
+    int pos=0;while(true){uint32_t t0=millis();pollButtons();if(evTap[BI_BACK]||evLong[BI_BACK])break;oled.clearBuffer();oled.setFont(uiFontSmall());String title=fileName;if(title.length()>20)title=title.substring(0,20);oled.drawUTF8(0,8,title.c_str());oled.drawHLine(0,11,128);int cur=pos;for(int r=0;r<6;r++){int e=preview.indexOf('\n',cur);if(e<0)e=preview.length();String ln=preview.substring(cur,e);if(ln.length()>21)ln=ln.substring(0,21);oled.drawUTF8(0,21+r*7,ln.c_str());cur=e<(int)preview.length()?e+1:e;}present();if(nav(BI_DOWN)||evTap[BI_OK])pos=cur>=(int)preview.length()?0:cur;if(nav(BI_UP))pos=max(0,pos-180);serviceFileWeb();frameWait(t0);}waitRelease();return;
   }
   showScreen("File selected",fileName,"Use phone for PNG/JPG","OLED needs RAW 128x64");waitAnyKey();
 }
@@ -6277,11 +6879,11 @@ bool fmChooseDestination(String& destination) {
     struct DEntry { String name,path; } items[48]; int n=0;
     File dir=SD.open(path,FILE_READ);
     if(dir && dir.isDirectory()) { File f=dir.openNextFile(); while(f && n<47) { if(f.isDirectory()) { String fp=String(f.name()); if(!fp.startsWith("/")) fp=(path=="/"?"/":""+path+"/")+fp; items[n++]={baseName(fp),fp}; } f.close(); f=dir.openNextFile(); } if(f)f.close(); dir.close(); }
-    oled.clearBuffer(); oled.setFont(u8g2_font_5x8_t_cyrillic); oled.drawStr(0,8,"DESTINATION FOLDER"); oled.drawHLine(0,11,128);
-    String pt=path; if(pt.length()>20)pt="..."+pt.substring(pt.length()-17); oled.drawStr(0,20,pt.c_str());
+    oled.clearBuffer(); oled.setFont(uiFontSmall()); oled.drawUTF8(0,8,"DESTINATION FOLDER"); oled.drawHLine(0,11,128);
+    String pt=path; if(pt.length()>20)pt="..."+pt.substring(pt.length()-17); oled.drawUTF8(0,20,pt.c_str());
     int total=n+2; sel=constrain(sel,0,total-1);
-    for(int r=0;r<4;r++){ int ix=(sel/4)*4+r; if(ix>=total)break; int y=30+r*8; String nm=ix==0?"[ USE THIS FOLDER ]":(ix==1?".. parent":items[ix-2].name); if(ix==sel){oled.drawBox(0,y-6,128,8);oled.setDrawColor(0);} oled.drawStr(2,y,nm.c_str()); if(ix==sel)oled.setDrawColor(1); }
-    oled.drawStr(0,63,"UP/DN select OK choose"); present(); serviceFileWeb(); frameWait(t0);
+    for(int r=0;r<4;r++){ int ix=(sel/4)*4+r; if(ix>=total)break; int y=30+r*8; String nm=ix==0?"[ USE THIS FOLDER ]":(ix==1?".. parent":items[ix-2].name); if(ix==sel){oled.drawBox(0,y-6,128,8);oled.setDrawColor(0);} oled.drawUTF8(2,y,nm.c_str()); if(ix==sel)oled.setDrawColor(1); }
+    oled.drawUTF8(0,63,"UP/DN select OK choose"); present(); serviceFileWeb(); frameWait(t0);
     if(evLong[BI_BACK]) { waitRelease(); return false; }
     if(nav(BI_UP))sel=max(0,sel-1); if(nav(BI_DOWN))sel=min(total-1,sel+1);
     if(evDown[BI_OK]) { if(sel==0){destination=path;waitRelease();return true;} if(sel==1){path=parentPath(path);sel=0;} else {path=items[sel-2].path;sel=0;} waitRelease(); }
@@ -6322,9 +6924,9 @@ void fmContextMenu(const String& currentPath, bool isDir, const String& currentN
     if(evLong[BI_BACK]) { waitRelease(); return; }
     if(nav(BI_UP))choice=(choice+total-1)%total;
     if(nav(BI_DOWN))choice=(choice+1)%total;
-    oled.clearBuffer(); oled.setFont(u8g2_font_5x8_t_cyrillic); oled.drawStr(0,8,"FILE ACTIONS"); oled.drawHLine(0,11,128);
+    oled.clearBuffer(); oled.setFont(uiFontSmall()); oled.drawUTF8(0,8,"FILE ACTIONS"); oled.drawHLine(0,11,128);
     int first=(choice/5)*5;
-    for(int r=0;r<5;r++){int ix=first+r;if(ix>=total)break;int y=22+r*9;if(ix==choice){oled.drawBox(0,y-7,128,9);oled.setDrawColor(0);}String label=labels[ix];if(ix==6&&!rawLogo)label="Boot logo (RAW 1024B only)";if(label.length()>24)label=label.substring(0,24);oled.drawStr(3,y,label.c_str());if(ix==choice)oled.setDrawColor(1);}
+    for(int r=0;r<5;r++){int ix=first+r;if(ix>=total)break;int y=22+r*9;if(ix==choice){oled.drawBox(0,y-7,128,9);oled.setDrawColor(0);}String label=labels[ix];if(ix==6&&!rawLogo)label="Boot logo (RAW 1024B only)";if(label.length()>24)label=label.substring(0,24);oled.drawUTF8(3,y,label.c_str());if(ix==choice)oled.setDrawColor(1);}
     // No footer line: it used to cover the final action on the 64px display.
     present(); serviceFileWeb(); frameWait(t0);
     if(!evTap[BI_OK]) continue;
@@ -6358,7 +6960,7 @@ void fmContextMenu(const String& currentPath, bool isDir, const String& currentN
         } else {if(f)f.close();showScreen("Image preview","RAW format required","128x64 / 1024 bytes","BACK: return");waitAnyKey();}
       } else if(low.endsWith(".txt")||low.endsWith(".ino")||low.endsWith(".h")||low.endsWith(".cpp")||low.endsWith(".json")||low.endsWith(".cfg")) {
         File f=SD.open(currentPath,FILE_READ); String preview; preview.reserve(600); if(f){while(f.available()&&preview.length()<600)preview+=(char)f.read();f.close();} int pos=0;
-        while(true){uint32_t pt=millis();pollButtons(); if(evTap[BI_BACK]||evLong[BI_BACK])break; oled.clearBuffer();oled.setFont(u8g2_font_5x8_t_cyrillic);String title=currentName;if(title.length()>20)title=title.substring(0,20);oled.drawStr(0,8,title.c_str());oled.drawHLine(0,11,128);int cur=pos;for(int r=0;r<6;r++){int e=preview.indexOf('\n',cur);if(e<0)e=preview.length();String ln=preview.substring(cur,e);if(ln.length()>21)ln=ln.substring(0,21);oled.drawStr(0,21+r*7,ln.c_str());cur=e<(int)preview.length()?e+1:e;}present();if(nav(BI_DOWN)||evTap[BI_OK])pos=cur>=(int)preview.length()?0:cur;if(nav(BI_UP))pos=max(0,pos-180);serviceFileWeb();frameWait(pt);} waitRelease();
+        while(true){uint32_t pt=millis();pollButtons(); if(evTap[BI_BACK]||evLong[BI_BACK])break; oled.clearBuffer();oled.setFont(uiFontSmall());String title=currentName;if(title.length()>20)title=title.substring(0,20);oled.drawUTF8(0,8,title.c_str());oled.drawHLine(0,11,128);int cur=pos;for(int r=0;r<6;r++){int e=preview.indexOf('\n',cur);if(e<0)e=preview.length();String ln=preview.substring(cur,e);if(ln.length()>21)ln=ln.substring(0,21);oled.drawUTF8(0,21+r*7,ln.c_str());cur=e<(int)preview.length()?e+1:e;}present();if(nav(BI_DOWN)||evTap[BI_OK])pos=cur>=(int)preview.length()?0:cur;if(nav(BI_UP))pos=max(0,pos-180);serviceFileWeb();frameWait(pt);} waitRelease();
       } else showScreen("Selected file",currentName,"Preview on phone panel","BACK: return");
       return;
     }
@@ -6386,17 +6988,17 @@ void runFmSettings() {
       if (cfg.sfx) SFX(SF_CLICK);
     }
     oled.clearBuffer();
-    oled.setFont(u8g2_font_6x13_t_cyrillic);
-    oled.drawStr(0, 12, "FM Settings");
+    oled.setFont(uiFontLarge());
+    oled.drawUTF8(0, 12, "FM Settings");
     oled.drawHLine(0, 16, 128);
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
+    oled.setFont(uiFontSmall());
     const char* names[] = {"Show file types", "Menu wrap", "Back"};
     for (int i=0; i<N; i++) {
       int y = 28 + i*10;
       if (i == sel) { oled.drawRBox(0, y-7, 128, 9, 2); oled.setDrawColor(0); }
-      oled.drawStr(4, y, names[i]);
-      if (i == 0) oled.drawStr(100, y, cfg.showFileTypes ? "ON" : "OFF");
-      if (i == 1) oled.drawStr(100, y, cfg.settingsWrap ? "ON" : "OFF");
+      oled.drawUTF8(4, y, names[i]);
+      if (i == 0) oled.drawUTF8(100, y, cfg.showFileTypes ? "ON" : "OFF");
+      if (i == 1) oled.drawUTF8(100, y, cfg.settingsWrap ? "ON" : "OFF");
       oled.setDrawColor(1);
     }
     present(); frameWait(t0);
@@ -6417,7 +7019,7 @@ void runLocalFileManager() {
     if(okDown&&!longActionFired&&millis()-okDownAt>=1500){longActionFired=true;bst[BI_OK].longDone=true; if(entryCount>0&&selected<entryCount){FMEntry f=entries[selected];fmContextMenu(f.path,f.isDir,f.name,path);needRefresh=true;}else{showScreen("File Manager","Folder is empty","Create folder in phone panel","BACK: return");waitAnyKey();needRefresh=true;} waitRelease();}
     if(evTap[BI_OK]&&!longActionFired&&entryCount>0&&selected<entryCount){FMEntry f=entries[selected];if(f.isDir){path=cleanPath(f.path);selected=0;needRefresh=true;}else{fmPreviewFileOnDevice(f.path,f.name);needRefresh=true;waitRelease();}}
     okWasDown=held(BI_OK);
-    oled.clearBuffer();oled.setFont(u8g2_font_5x8_t_cyrillic);oled.drawStr(0,8,"FILE MANAGER");oled.drawHLine(0,11,128);String pt=path;if(pt.length()>11)pt="..."+pt.substring(pt.length()-8);oled.drawStr(0,20,pt.c_str()); if(cfg.showFileTypes && entryCount>0){String typ=fmFileType(entries[selected].name,entries[selected].size,entries[selected].isDir);if(typ.length()>21)typ=typ.substring(0,21);oled.drawStr(0,63,typ.c_str());} int first=(selected/4)*4;for(int r=0;r<4;r++){int ix=first+r;if(ix>=entryCount)break;int y=29+r*9;if(ix==selected){oled.drawRBox(0,y-7,128,9,2);oled.setDrawColor(0);}String nm=String(entries[ix].isDir?"> ":"  ")+entries[ix].name;if(nm.length()>21)nm=nm.substring(0,21);oled.drawStr(3,y,nm.c_str());if(ix==selected)oled.setDrawColor(1);}{String pos=String(entryCount)+" files";oled.drawStr(74,20,pos.c_str());}present();frameWait(t0);
+    oled.clearBuffer();oled.setFont(uiFontSmall());oled.drawUTF8(0,8,"FILE MANAGER");oled.drawHLine(0,11,128);String pt=path;if(pt.length()>11)pt="..."+pt.substring(pt.length()-8);oled.drawUTF8(0,20,pt.c_str()); if(cfg.showFileTypes && entryCount>0){String typ=fmFileType(entries[selected].name,entries[selected].size,entries[selected].isDir);if(typ.length()>21)typ=typ.substring(0,21);oled.drawUTF8(0,63,typ.c_str());} int first=(selected/4)*4;for(int r=0;r<4;r++){int ix=first+r;if(ix>=entryCount)break;int y=29+r*9;if(ix==selected){oled.drawRBox(0,y-7,128,9,2);oled.setDrawColor(0);}String nm=String(entries[ix].isDir?"> ":"  ")+entries[ix].name;if(nm.length()>21)nm=nm.substring(0,21);oled.drawUTF8(3,y,nm.c_str());if(ix==selected)oled.setDrawColor(1);}{String pos=String(entryCount)+" files";oled.drawUTF8(74,20,pos.c_str());}present();frameWait(t0);
   }
   waitRelease();
 }
@@ -6479,14 +7081,14 @@ void runSdFirmwareUpdate() {
     }
 
     oled.clearBuffer();
-    oled.setFont(u8g2_font_6x13_t_cyrillic);
-    oled.drawStr(0, 12, "SD Firmware Update");
+    oled.setFont(uiFontLarge());
+    oled.drawUTF8(0, 12, "SD Firmware Update");
     oled.drawHLine(0, 16, 128);
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
+    oled.setFont(uiFontSmall());
 
     if (count == 0) {
-      oled.drawStr(4, 34, "No .bin files in root /");
-      oled.drawStr(4, 48, "BACK: exit");
+      oled.drawUTF8(4, 34, "No .bin files in root /");
+      oled.drawUTF8(4, 48, "BACK: exit");
     } else {
       int first = (sel / 4) * 4;
       for (int row = 0; row < 4; row++) {
@@ -6499,12 +7101,12 @@ void runSdFirmwareUpdate() {
         }
         String nm = bins[i].name;
         if (nm.length() > 16) nm = nm.substring(0, 16);
-        oled.drawStr(3, y, nm.c_str());
+        oled.drawUTF8(3, y, nm.c_str());
         String sz = String(bins[i].size / 1024) + "K";
-        oled.drawStr(105, y, sz.c_str());
+        oled.drawUTF8(105, y, sz.c_str());
         oled.setDrawColor(1);
       }
-      oled.drawStr(3, 63, "OK: flash   BACK: exit");
+      oled.drawUTF8(3, 63, "OK: flash   BACK: exit");
     }
     present();
     frameWait(t0);
@@ -6524,8 +7126,8 @@ void runSdFirmwareUpdate() {
     otaInProgress = true;
 
     oled.clearBuffer();
-    oled.setFont(u8g2_font_6x13_t_cyrillic);
-    oled.drawStr(10, 15, "Preparing...");
+    oled.setFont(uiFontLarge());
+    oled.drawUTF8(10, 15, "Preparing...");
     oled.sendBuffer();
 
     // Wi-Fi нужно выключать до Update.begin(), а не после ошибки.
@@ -6560,13 +7162,13 @@ void runSdFirmwareUpdate() {
           lastDraw = millis();
           int pct = (int)(((uint64_t)written * 100UL) / fileSize);
           oled.clearBuffer();
-          oled.setFont(u8g2_font_6x13_t_cyrillic);
-          oled.drawStr(5, 15, "Flashing...");
-          oled.setFont(u8g2_font_5x8_t_cyrillic);
-          oled.drawStr(5, 30, (String(written / 1024) + " KB").c_str());
+          oled.setFont(uiFontLarge());
+          oled.drawUTF8(5, 15, "Flashing...");
+          oled.setFont(uiFontSmall());
+          oled.drawUTF8(5, 30, (String(written / 1024) + " KB").c_str());
           oled.drawFrame(5, 40, 118, 8);
           oled.drawBox(7, 42, (pct * 114) / 100, 4);
-          oled.drawStr(5, 60, "DO NOT POWER OFF");
+          oled.drawUTF8(5, 60, "DO NOT POWER OFF");
           oled.sendBuffer();
         }
         yield();
@@ -6584,9 +7186,9 @@ void runSdFirmwareUpdate() {
 
     if (success) {
       oled.clearBuffer();
-      oled.setFont(u8g2_font_6x13_t_cyrillic);
-      oled.drawStr(15, 25, "SUCCESS!");
-      oled.drawStr(15, 40, "Rebooting...");
+      oled.setFont(uiFontLarge());
+      oled.drawUTF8(15, 25, "SUCCESS!");
+      oled.drawUTF8(15, 40, "Rebooting...");
       oled.sendBuffer();
       delay(1500);
       ESP.restart();
@@ -6595,14 +7197,14 @@ void runSdFirmwareUpdate() {
     if (started) Update.abort();
     if (!otaError.length()) otaError = String(Update.errorString());
     oled.clearBuffer();
-    oled.setFont(u8g2_font_6x13_t_cyrillic);
-    oled.drawStr(10, 15, "OTA FAILED");
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
+    oled.setFont(uiFontLarge());
+    oled.drawUTF8(10, 15, "OTA FAILED");
+    oled.setFont(uiFontSmall());
     String shortError = otaError;
     if (shortError.length() > 24) shortError = shortError.substring(0, 24);
-    oled.drawStr(5, 32, shortError.c_str());
-    oled.drawStr(5, 45, ("Written: " + String(written) + " B").c_str());
-    oled.drawStr(5, 60, "OK/BACK: return");
+    oled.drawUTF8(5, 32, shortError.c_str());
+    oled.drawUTF8(5, 45, ("Written: " + String(written) + " B").c_str());
+    oled.drawUTF8(5, 60, "OK/BACK: return");
     oled.sendBuffer();
     waitAnyKey();
 
@@ -6758,14 +7360,14 @@ void runNotesActions(const String& name) {
       else if (sel == 7) return;
     }
     oled.clearBuffer();
-    oled.setFont(u8g2_font_6x13_t_cyrillic);
+    oled.setFont(uiFontLarge());
     oled.drawUTF8(0, 12, "Actions");
     oled.drawHLine(0, 16, 128);
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
+    oled.setFont(uiFontSmall());
     for (int i = 0; i < N; i++) {
       int y = 26 + i * 6;
       if (i == sel) { oled.drawRBox(0, y-6, 128, 8, 2); oled.setDrawColor(0); }
-      oled.drawStr(3, y, actions[i]);
+      oled.drawUTF8(3, y, actions[i]);
       if (i == sel) oled.setDrawColor(1);
     }
     present();
@@ -6826,14 +7428,14 @@ void runNotes() {
 
     // === ОТРИСОВКА ===
     oled.clearBuffer();
-    oled.setFont(u8g2_font_6x13_t_cyrillic);
+    oled.setFont(uiFontLarge());
     oled.drawUTF8(0, 12, "Notes");
     oled.drawHLine(0, 16, 128);
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
+    oled.setFont(uiFontSmall());
 
     if (notesCount == 0) {
-      oled.drawStr(10, 36, "No notes");
-      oled.drawStr(10, 48, "OK: create");
+      oled.drawUTF8(10, 36, "No notes");
+      oled.drawUTF8(10, 48, "OK: create");
     } else {
       int start = max(0, notesSel - 1);
       for (int i = 0; i < 4 && start + i < notesCount; i++) {
@@ -6842,189 +7444,297 @@ void runNotes() {
         if (idx == notesSel) { oled.drawRBox(0, y-7, 128, 9, 2); oled.setDrawColor(0); }
         String nm = notesList[idx];
         if (nm.length() > 18) nm = nm.substring(0, 18);
-        oled.drawStr(3, y, nm.c_str());
+        oled.drawUTF8(3, y, nm.c_str());
         if (idx == notesSel) oled.setDrawColor(1);
       }
     }
-    oled.drawStr(0, 63, "OK: open  hold OK: actions");
+    oled.drawUTF8(0, 63, "OK: open  hold OK: actions");
     present();
     frameWait(t0);
   }
   waitRelease();
 }
-void runStore() {
-  if (WiFi.status() != WL_CONNECTED) {
-    showScreen("Store", "Wi-Fi not connected", "Check Settings");
-    waitAnyKey();
-    return;
-  }
-
+void runStoreCatalog() {
+  if (WiFi.status() != WL_CONNECTED) { showScreen("Catalog", "Wi-Fi off", ""); waitAnyKey(); return; }
   String storeUrl = prefs.getString("store_url", "");
-  if (!storeUrl.length()) {
-    storeUrl = "http://192.168.1.100:8000";
-    if (!runKeyboard("Store URL", storeUrl, false)) return;
-    prefs.putString("store_url", storeUrl);
+  if (!storeUrl.length()) { showScreen("Catalog", "URL empty", "Set in Settings"); waitAnyKey(); return; }
+  while (storeUrl.length() > 1 && storeUrl.endsWith("/")) storeUrl.remove(storeUrl.length() - 1);
+  if (!SD.exists("/apps")) SD.mkdir("/apps");
+  showScreen("Catalog", "Loading...", storeUrl);
+
+  // --- 1. Список приложений через ручной TLS ---
+  String host; int port = 443;
+  String u = storeUrl; if (u.startsWith("https://")) u = u.substring(8); else if (u.startsWith("http://")) { u = u.substring(7); port = 80; }
+  int slash = u.indexOf('/'); String hp = (slash < 0) ? u : u.substring(0, slash);
+  int colon = hp.indexOf(':'); if (colon >= 0) { host = hp.substring(0, colon); port = hp.substring(colon + 1).toInt(); } else { host = hp; }
+
+  WiFiClientSecure cli; cli.setInsecure(); cli.setTimeout(15);
+  if (!cli.connect(host.c_str(), port, 10000)) { showScreen("Catalog", "Connect fail", host); waitAnyKey(); return; }
+  cli.print("GET /api/apps HTTP/1.1\r\n");
+  cli.print("Host: " + host + "\r\n");
+  cli.print("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0\r\n");
+  cli.print("skip_zrok_interstitial: true\r\n");
+  cli.print("Accept: application/json\r\n");
+  cli.print("Connection: close\r\n\r\n");
+  uint32_t tmo = millis();
+  while (cli.available() == 0 && millis() - tmo < 10000) { yield(); delay(20); }
+  String full = "";
+  while (cli.available()) full += (char)cli.read();
+  cli.stop();
+
+  int hdrEnd = full.indexOf("\r\n\r\n");
+  if (hdrEnd < 0) { showScreen("Catalog", "Bad response", full.substring(0, 30)); waitAnyKey(); return; }
+  String headers = full.substring(0, hdrEnd);
+  String json = full.substring(hdrEnd + 4);
+  if (!headers.startsWith("HTTP/1.1 200") && !headers.startsWith("HTTP/1.0 200")) {
+    showScreen("Catalog", "HTTP " + headers.substring(9, 12), ""); waitAnyKey(); return;
   }
-
-  String channel = prefs.getString("store_ch", "stable");
-
-  showScreen("Store", "Checking...", "v" + String(FIRMWARE_VERSION));
-
-  String url = storeUrl + "/api/check?channel=" + channel
-             + "&current_version=" + FIRMWARE_VERSION;
-
-  WiFiClient client;
-  HTTPClient http;
-  http.setTimeout(10000);
-  if (!http.begin(client, url)) {
-    showScreen("Store", "Connection failed", url);
-    waitAnyKey();
-    return;
-  }
-  int code = http.GET();
-  if (code != 200) {
-    showScreen("Store", "HTTP " + String(code), "");
-    waitAnyKey();
-    http.end();
-    return;
-  }
-  String body = http.getString();
-  http.end();
-
+  full = "";
   JsonDocument doc;
-  if (deserializeJson(doc, body)) {
-    showScreen("Store", "Bad JSON", "");
-    waitAnyKey();
-    return;
-  }
+  if (deserializeJson(doc, json)) { showScreen("Catalog", "Bad JSON", ""); waitAnyKey(); return; }
+  JsonArray arr = doc.as<JsonArray>();
+  int count = arr.size();
+  if (count == 0) { showScreen("Catalog", "Empty", "Upload apps first"); waitAnyKey(); return; }
+  if (count > 64) count = 64;
 
+  // --- 2. Копируем данные в String, чтобы doc можно было освободить ---
+  String slugs[64], names[64], types[64];
+  for (int i = 0; i < count; i++) {
+    slugs[i] = String((const char*)(arr[i]["slug"] | ""));
+    names[i] = String((const char*)(arr[i]["name"] | "?"));
+    types[i] = String((const char*)(arr[i]["type"] | ""));
+  }
+  json = ""; doc.clear();
+  yield();
+
+  // --- 3. Меню ---
+  int sel = 0, top = 0;
+  const int ROWS = 4;
+  while (true) {
+    uint32_t t0 = millis();
+    pollButtons();
+    if (evTap[BI_BACK] || evLong[BI_BACK]) return;
+    if (nav(BI_UP) && sel > 0) sel--;
+    if (nav(BI_DOWN) && sel < count - 1) sel++;
+    if (sel < top) top = sel;
+    if (sel >= top + ROWS) top = sel - ROWS + 1;
+
+    oled.clearBuffer();
+    oled.setFont(u8g2_font_6x13_t_cyrillic);
+    oled.drawStr(0, 12, "Store");
+    oled.setFont(u8g2_font_5x8_t_cyrillic);
+    String cnt = String(sel + 1) + "/" + String(count);
+    oled.drawStr(126 - oled.getStrWidth(cnt.c_str()), 11, cnt.c_str());
+    oled.drawHLine(0, 15, 128);
+    for (int r = 0; r < ROWS; r++) {
+      int ix = top + r;
+      if (ix >= count) break;
+      int y = 26 + r * 9;
+      if (ix == sel) { oled.drawRBox(0, y - 7, 128, 9, 2); oled.setDrawColor(0); }
+      String line = names[ix] + " [" + types[ix] + "]";
+      if (line.length() > 21) line = line.substring(0, 21);
+      oled.drawStr(2, y, line.c_str());
+      if (ix == sel) oled.setDrawColor(1);
+    }
+    oled.drawStr(0, 63, "OK install BACK exit");
+    present();
+    frameWait(t0);
+
+    if (evDown[BI_OK]) {
+      String slug = slugs[sel];
+      String type = types[sel];
+      String niceName = names[sel];
+      if (!slug.length()) continue;
+
+      // --- 4. Скачивание через ручной TLS ---
+      String dlPath, savePath;
+      if (type == "image") { dlPath = "/download/" + slug + ".raw"; savePath = "/bootlogo.raw"; }
+      else if (type == "language") { dlPath = "/download/" + slug + ".json"; savePath = "/" + slug + ".json"; }
+      else { dlPath = "/download/" + slug + ".mbg"; savePath = "/apps/" + slug + ".mbg"; }
+
+      showScreen("Download", niceName, slug);
+      yield(); delay(500);
+
+      WiFiClientSecure dlc; dlc.setInsecure(); dlc.setTimeout(30);
+      if (!dlc.connect(host.c_str(), port, 15000)) {
+        showScreen("Download", "Conn fail", host); waitAnyKey(); continue;
+      }
+      dlc.print("GET " + dlPath + " HTTP/1.1\r\n");
+      dlc.print("Host: " + host + "\r\n");
+      dlc.print("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0\r\n");
+      dlc.print("skip_zrok_interstitial: true\r\n");
+      dlc.print("Connection: close\r\n\r\n");
+
+      uint32_t dt = millis();
+      while (dlc.available() == 0 && millis() - dt < 15000) { yield(); delay(20); }
+      String dHdr = "";
+      while (dlc.available()) {
+        char ch = (char)dlc.read();
+        dHdr += ch;
+        if (dHdr.endsWith("\r\n\r\n")) break;
+      }
+      if (dHdr.indexOf(" 200 ") < 0) {
+        String code = dHdr.length() > 12 ? dHdr.substring(9, 12) : "?";
+        dlc.stop(); showScreen("Download", "HTTP " + code, dHdr.substring(0, 20)); waitAnyKey(); continue;
+      }
+      String clStr = "";
+      int clPos = dHdr.indexOf("Content-Length: ");
+      if (clPos >= 0) { int clEnd = dHdr.indexOf("\r\n", clPos); clStr = dHdr.substring(clPos + 16, clEnd); }
+      int clen = clStr.toInt();
+
+      File f = SD.open(savePath, FILE_WRITE);
+      if (!f) { dlc.stop(); showScreen("Download", "SD fail", savePath); waitAnyKey(); continue; }
+      uint8_t buf[512]; int written = 0;
+      uint32_t lastDraw = 0;
+      while (dlc.connected() && (clen <= 0 || written < clen)) {
+        size_t n = dlc.readBytes(buf, sizeof(buf));
+        if (n == 0) { if (!dlc.connected()) break; delay(10); continue; }
+        f.write(buf, n);
+        written += n;
+        if (millis() - lastDraw > 250) {
+          lastDraw = millis();
+          oled.clearBuffer();
+          oled.setFont(u8g2_font_5x8_t_cyrillic);
+          oled.drawStr(0, 12, niceName.c_str());
+          oled.drawStr(0, 26, (String(written) + " B").c_str());
+          present();
+        }
+      }
+      f.close(); dlc.stop();
+
+      showScreen("Installed", niceName, String(written) + " bytes", savePath);
+      waitAnyKey();
+      if (type == "app") scanMbApps();
+      if (type == "image") { bootLogoFromSD = true; prefs.putBool("bootlogo_sd", true); }
+      if (type == "language") {
+        cfg.langCount = 3;
+        if (SD.exists("/lang-de.json")) cfg.langCount = 4;
+        if (SD.exists("/lang-fr.json")) cfg.langCount = 5;
+        saveCfg();
+      }
+    }
+  }
+}
+void runStore() {
+  if (WiFi.status() != WL_CONNECTED) { showScreen("Store", "Wi-Fi off", ""); waitAnyKey(); return; }
+  String storeUrl = prefs.getString("store_url", "");
+  if (!storeUrl.length()) { showScreen("Store", "URL empty", "Set in Settings"); waitAnyKey(); return; }
+  while (storeUrl.length() > 1 && storeUrl.endsWith("/")) storeUrl.remove(storeUrl.length() - 1);
+  String url = storeUrl + "/api/check?channel=stable&current_version=" FIRMWARE_VERSION;
+  String host; int port = 443;
+  String u = url; if (u.startsWith("https://")) u = u.substring(8); else if (u.startsWith("http://")) { u = u.substring(7); port = 80; }
+  int slash = u.indexOf('/'); String hp = (slash < 0) ? u : u.substring(0, slash);
+  int colon = hp.indexOf(':'); if (colon >= 0) { host = hp.substring(0, colon); port = hp.substring(colon + 1).toInt(); } else { host = hp; }
+  String path = (slash < 0) ? "/" : u.substring(slash);
+  showScreen("Store", "Checking...", host);
+  WiFiClientSecure cli; cli.setInsecure(); cli.setTimeout(10);
+  if (!cli.connect(host.c_str(), port, 10000)) { showScreen("Store", "Connect fail", host); waitAnyKey(); return; }
+  cli.print("GET " + path + " HTTP/1.1\r\n");
+  cli.print("Host: " + host + "\r\n");
+  cli.print("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0\r\n");
+  cli.print("skip_zrok_interstitial: true\r\n");
+  cli.print("Accept: application/json\r\n");
+  cli.print("Connection: close\r\n\r\n");
+  uint32_t tmo = millis();
+  while (cli.available() == 0 && millis() - tmo < 8000) { yield(); delay(20); }
+  String body = "";
+  while (cli.available()) body += (char)cli.read();
+  cli.stop();
+  int hdrEnd = body.indexOf("\r\n\r\n");
+  if (hdrEnd < 0) { showScreen("Store", "Bad response", body.substring(0, 20)); waitAnyKey(); return; }
+  String headers = body.substring(0, hdrEnd);
+  String json = body.substring(hdrEnd + 4);
+  if (!headers.startsWith("HTTP/1.1 200") && !headers.startsWith("HTTP/1.0 200")) {
+    showScreen("Store", "HTTP " + headers.substring(9, 12), headers.substring(0, 30));
+    waitAnyKey(); return;
+  }
+  JsonDocument doc;
+  if (deserializeJson(doc, json)) { showScreen("Store", "Bad JSON", ""); waitAnyKey(); return; }
   bool hasUpdate = doc["update"] | false;
   if (!hasUpdate) {
     String latest = doc["latest"].as<String>();
     showScreen("Store", "Up to date", latest.length() ? "v" + latest : "");
-    waitAnyKey();
-    return;
+    waitAnyKey(); return;
   }
-
   String newVer = doc["version"].as<String>();
-  String title  = doc["title"].as<String>();
   String dlPath = doc["download_url"].as<String>();
-  int size      = doc["size"] | 0;
-
-  // Экран подтверждения
+  if (!dlPath.startsWith("/")) dlPath = "/" + dlPath;
   oled.clearBuffer();
   oled.setFont(u8g2_font_6x13_t_cyrillic);
   oled.drawStr(0, 12, "Update available");
   oled.drawHLine(0, 16, 128);
   oled.setFont(u8g2_font_5x8_t_cyrillic);
-  oled.drawUTF8(4, 28, ("v" + newVer + " / " + channel).c_str());
-  if (title.length()) {
-    String t = title; if (t.length() > 20) t = t.substring(0, 20);
-    oled.drawUTF8(4, 40, t.c_str());
-  }
-  oled.drawStr(4, 52, (String(size/1024) + " KB").c_str());
-  oled.drawStr(0, 63, "OK: install   BACK: no");
+  oled.drawUTF8(4, 28, ("v" + newVer).c_str());
+  oled.drawStr(0, 63, "OK: install BACK: no");
   present();
-
   waitRelease();
   bool doIt = false;
   while (true) {
     pollButtons();
     if (evDown[BI_OK]) { doIt = true; break; }
     if (evTap[BI_BACK] || evLong[BI_BACK]) break;
-    present();
-    delay(15);
+    present(); delay(15);
   }
   if (!doIt) return;
-
-  // Скачивание + прошивка
   otaInProgress = true;
-
   String fullUrl = storeUrl + dlPath;
-  WiFiClient dlClient;
-  HTTPClient dlHttp;
-  dlHttp.setTimeout(15000);
-  if (!dlHttp.begin(dlClient, fullUrl)) {
-    showScreen("Store", "DL failed", ""); waitAnyKey();
-    otaInProgress = false;
-    return;
+  String dhost; int dport = 443;
+  String du = fullUrl; if (du.startsWith("https://")) du = du.substring(8); else if (du.startsWith("http://")) { du = du.substring(7); dport = 80; }
+  int dslash = du.indexOf('/'); String dhp = (dslash < 0) ? du : du.substring(0, dslash);
+  int dcolon = dhp.indexOf(':'); if (dcolon >= 0) { dhost = dhp.substring(0, dcolon); dport = dhp.substring(dcolon + 1).toInt(); } else { dhost = dhp; }
+  String dpath = (dslash < 0) ? "/" : du.substring(dslash);
+  WiFiClientSecure dlc; dlc.setInsecure(); dlc.setTimeout(30);
+  if (!dlc.connect(dhost.c_str(), dport, 15000)) { showScreen("Store", "DL connect fail", dhost); waitAnyKey(); otaInProgress = false; return; }
+  dlc.print("GET " + dpath + " HTTP/1.1\r\n");
+  dlc.print("Host: " + dhost + "\r\n");
+  dlc.print("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0\r\n");
+  dlc.print("skip_zrok_interstitial: true\r\n");
+  dlc.print("Connection: close\r\n\r\n");
+  uint32_t dtmo = millis();
+  while (dlc.available() == 0 && millis() - dtmo < 10000) { yield(); delay(20); }
+  String dheaders = "";
+  while (dlc.available()) {
+    char ch = (char)dlc.read();
+    dheaders += ch;
+    if (dheaders.endsWith("\r\n\r\n")) break;
   }
-  int dlCode = dlHttp.GET();
-  if (dlCode != 200) {
-    showScreen("Store", "DL HTTP " + String(dlCode), "");
-    waitAnyKey();
-    dlHttp.end();
-    otaInProgress = false;
-    return;
-  }
-
-  int len = dlHttp.getSize();
-  if (len <= 0) {
-    showScreen("Store", "Size unknown", "Cannot OTA");
-    waitAnyKey();
-    dlHttp.end();
-    otaInProgress = false;
-    return;
-  }
-
-  if (!Update.begin(len)) {
-    showScreen("Store", "OTA begin", Update.errorString());
-    waitAnyKey();
-    dlHttp.end();
-    otaInProgress = false;
-    return;
-  }
-
-  WiFiClient* stream = dlHttp.getStreamPtr();
+  if (dheaders.indexOf(" 200 ") < 0) { showScreen("Store", "DL HTTP fail", dheaders.substring(0, 30)); waitAnyKey(); otaInProgress = false; dlc.stop(); return; }
+  String clStr = "";
+  int clPos = dheaders.indexOf("Content-Length: ");
+  if (clPos >= 0) { int clEnd = dheaders.indexOf("\r\n", clPos); clStr = dheaders.substring(clPos + 16, clEnd); }
+  int contentLen = clStr.toInt();
+  if (contentLen <= 0) { showScreen("Store", "Size unknown", "Cannot OTA"); waitAnyKey(); otaInProgress = false; dlc.stop(); return; }
+  if (!Update.begin(contentLen)) { showScreen("Store", "OTA begin", Update.errorString()); waitAnyKey(); otaInProgress = false; dlc.stop(); return; }
   uint8_t buf[512];
-  int written = 0;
-  uint32_t lastDraw = 0;
-  uint32_t lastData = millis();
-
-  while (dlHttp.connected() && written < len) {
-    size_t sz = stream->readBytes(buf, min((int)sizeof(buf), len - written));
-    if (sz == 0) {
-      if (millis() - lastData > 10000) break;
-      delay(10);
-      continue;
-    }
-    lastData = millis();
-    if (Update.write(buf, sz) != sz) break;
-    written += sz;
-
+  int written = 0; uint32_t lastDraw = 0;
+  while (dlc.connected() && written < contentLen) {
+    size_t n = dlc.readBytes(buf, min((int)sizeof(buf), contentLen - written));
+    if (n == 0) { if (!dlc.connected()) break; delay(10); continue; }
+    if (Update.write(buf, n) != n) break;
+    written += n;
     if (millis() - lastDraw > 200) {
       lastDraw = millis();
       oled.clearBuffer();
       oled.setFont(u8g2_font_6x13_t_cyrillic);
       oled.drawStr(10, 15, "Installing...");
       oled.setFont(u8g2_font_5x8_t_cyrillic);
-      oled.drawStr(10, 30,
-        (String(written/1024) + " / " + String(len/1024) + " KB").c_str());
+      oled.drawStr(10, 30, (String(written/1024) + " / " + String(contentLen/1024) + " KB").c_str());
       oled.drawFrame(10, 42, 108, 6);
-      int pct = (written * 100) / len;
+      int pct = (written * 100) / contentLen;
       oled.drawBox(12, 44, pct * 104 / 100, 2);
       present();
     }
   }
-  dlHttp.end();
-
-  if (written == len && Update.end(true) && !Update.hasError()) {
+  dlc.stop();
+  if (written == contentLen && Update.end(true) && !Update.hasError()) {
     oled.clearBuffer();
     oled.setFont(u8g2_font_6x13_t_cyrillic);
     oled.drawStr(20, 25, "SUCCESS!");
     oled.drawStr(15, 42, "Rebooting...");
-    present();
-    delay(2000);
-    ESP.restart();
+    present(); delay(2000); ESP.restart();
   } else {
-    Update.abort();
-    otaInProgress = false;
-    oled.clearBuffer();
-    oled.setFont(u8g2_font_6x13_t_cyrillic);
-    oled.drawStr(10, 20, "Update failed");
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
-    oled.drawStr(10, 40, Update.errorString());
-    present();
+    Update.abort(); otaInProgress = false;
+    showScreen("Store", "Update fail", Update.errorString());
     waitAnyKey();
   }
 }
@@ -7093,8 +7803,8 @@ void runDynSnake(JsonDocument& doc) {
       else oled.drawBox(px,py,cs-1,cs-1);
     }
     oled.drawDisc(cx+foodX*cs+(cs/2),cy+foodY*cs+(cs/2),2);
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
-    oled.drawStr(2,62,("S "+String(score)).c_str());
+    oled.setFont(uiFontSmall());
+    oled.drawUTF8(2,62,("S "+String(score)).c_str());
     present(); frameWait(t0);
   }
 }
@@ -7164,9 +7874,9 @@ void runDynRunner(JsonDocument& doc) {
     } else if (evDown[BI_OK] && millis()-deadAt > 600) reset();
 
     oled.clearBuffer();
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
-    oled.drawStr(0,7,("HI "+padNum(getBest(APP_DINO),5)).c_str());
-    oled.drawStr(128-oled.getStrWidth(padNum((int)score,5).c_str()),7,padNum((int)score,5).c_str());
+    oled.setFont(uiFontSmall());
+    oled.drawUTF8(0,7,("HI "+padNum(getBest(APP_DINO),5)).c_str());
+    oled.drawUTF8(128-oled.getUTF8Width(padNum((int)score,5).c_str()),7,padNum((int)score,5).c_str());
     oled.drawHLine(0,GROUND_Y+1,128);
     for (int i=0;i<10;i++) {
       int px = ((i*37-(int)scroll)%128+128)%128;
@@ -7234,9 +7944,9 @@ void runDynFlappy(JsonDocument& doc) {
     drawBird(BX,(int)by,(frameN/3)%2);
     oled.drawHLine(0,GROUND_Y,128);
     oled.setDrawColor(0); oled.drawBox(0,0,128,9); oled.setDrawColor(1);
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
-    oled.drawStr(2,7,("BEST "+padNum(getBest(APP_FLAPPY),3)).c_str());
-    oled.drawStr(126-oled.getStrWidth(padNum(score,3).c_str()),7,padNum(score,3).c_str());
+    oled.setFont(uiFontSmall());
+    oled.drawUTF8(2,7,("BEST "+padNum(getBest(APP_FLAPPY),3)).c_str());
+    oled.drawUTF8(126-oled.getUTF8Width(padNum(score,3).c_str()),7,padNum(score,3).c_str());
     if (dead && millis()-deadAt>300) overlayBox("GAME OVER",("Score "+String(score)).c_str());
     present(); frameWait(t0);
   }
@@ -7327,8 +8037,8 @@ void runDynMaze(JsonDocument& doc) {
     oled.drawFrame(foodX*CS+1,foodY*CS+1,4,4);
     for (int i=len-1;i>0;i--) oled.drawRBox(snX[i]*CS+1,snY[i]*CS+1,4,4,1);
     oled.drawDisc(snX[0]*CS+3,snY[0]*CS+3,2);
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
-    oled.drawStr(0,62,("FOOD "+String(score/10)+" HI "+String(best/10)).c_str());
+    oled.setFont(uiFontSmall());
+    oled.drawUTF8(0,62,("FOOD "+String(score/10)+" HI "+String(best/10)).c_str());
     if (dead) overlayBox("CRASHED","OK: retry");
     present(); frameWait(t0);
   }
@@ -7395,8 +8105,8 @@ void runDynJumper(JsonDocument& doc) {
       if (py>=-3 && py<=64) oled.drawRBox(px,py,14,3,1);
     }
     oled.drawDisc((int)jx,(int)jy,3);
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
-    oled.drawStr(0,62,("JUMPS "+String(score)).c_str());
+    oled.setFont(uiFontSmall());
+    oled.drawUTF8(0,62,("JUMPS "+String(score)).c_str());
     if (dead) overlayBox("FELL!","OK: retry");
     present(); frameWait(t0);
   }
@@ -7452,8 +8162,8 @@ void runDynInvaders(JsonDocument& doc) {
     for (int i=0;i<enemyCount;i++) if (alive[i]) oled.drawBox((int)ex[i],ey[i],8,4);
     oled.drawRBox((int)shipX-4,54,8,4,2);
     if (shotX>=0) oled.drawBox((int)shotX,(int)shotY,2,4);
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
-    oled.drawStr(2,62,("S "+String(score)).c_str());
+    oled.setFont(uiFontSmall());
+    oled.drawUTF8(2,62,("S "+String(score)).c_str());
     present(); frameWait(t0);
   }
 }
@@ -7498,8 +8208,8 @@ void runDynPong(JsonDocument& doc) {
     oled.drawBox(2,paddleL,PW,PH);
     oled.drawBox(124,paddleR,PW,PH);
     oled.drawDisc((int)ballX,(int)ballY,1);
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
-    oled.drawStr(2,62,(String(scoreL)+" : "+String(scoreR)).c_str());
+    oled.setFont(uiFontSmall());
+    oled.drawUTF8(2,62,(String(scoreL)+" : "+String(scoreR)).c_str());
     present(); frameWait(t0);
   }
 }
@@ -7573,8 +8283,8 @@ void runDynBreakout(JsonDocument& doc) {
     }
     oled.drawRBox(paddleX,54,paddleWidth,PH,2);
     oled.drawDisc((int)bx,(int)by,2);
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
-    oled.drawStr(2,62,("S "+String(score)).c_str());
+    oled.setFont(uiFontSmall());
+    oled.drawUTF8(2,62,("S "+String(score)).c_str());
     present(); frameWait(t0);
   }
 }
@@ -7662,15 +8372,15 @@ void runDynCalculator(JsonDocument& doc) {
 
     // Отрисовка
     oled.clearBuffer();
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
+    oled.setFont(uiFontSmall());
     String dispE = expr;
     if (dispE.length() > 20) dispE = "..." + dispE.substring(dispE.length()-17);
-    oled.drawStr(0, 8, dispE.c_str());
+    oled.drawUTF8(0, 8, dispE.c_str());
     
-    oled.setFont(u8g2_font_6x13_tr);
+    oled.setFont(uiFontLarge());
     String dispR = result;
     if (dispR.length() > 16) dispR = dispR.substring(0, 16);
-    oled.drawStr(0, 22, dispR.c_str());
+    oled.drawUTF8(0, 22, dispR.c_str());
     oled.drawHLine(0, 25, 128);
 
     // 4x4 кнопки
@@ -7684,11 +8394,11 @@ void runDynCalculator(JsonDocument& doc) {
       if (r==curR && c==curC) {
         oled.drawRBox(x, y, bw, bh, 2);
         oled.setDrawColor(0);
-        oled.drawStr(x + (bw - oled.getStrWidth(lbl.c_str()))/2, y+bh-2, lbl.c_str());
+        oled.drawUTF8(x + (bw - oled.getUTF8Width(lbl.c_str()))/2, y+bh-2, lbl.c_str());
         oled.setDrawColor(1);
       } else {
         oled.drawFrame(x, y, bw, bh);
-        oled.drawStr(x + (bw - oled.getStrWidth(lbl.c_str()))/2, y+bh-2, lbl.c_str());
+        oled.drawUTF8(x + (bw - oled.getUTF8Width(lbl.c_str()))/2, y+bh-2, lbl.c_str());
       }
     }
     present();
@@ -7697,7 +8407,6 @@ void runDynCalculator(JsonDocument& doc) {
 }
 void runDynMiniApp(JsonDocument& doc) {
   waitRelease();
-  
   struct MV { String name; int32_t value; };
   MV vars[8];
   int nv = 0;
@@ -7705,7 +8414,7 @@ void runDynMiniApp(JsonDocument& doc) {
   for (JsonPair kv : vobj) {
     if (nv >= 8) break;
     vars[nv].name = String(kv.key().c_str());
-    vars[nv].value = kv.value().as<long>();
+    vars[nv].value = kv.value().as<int32_t>();
     nv++;
   }
   
@@ -7718,6 +8427,8 @@ void runDynMiniApp(JsonDocument& doc) {
     uint8_t action;
     String target;
     String val;
+    String sysName;
+    String sysArg;
   };
   MBtn btn[16];
   int nb = 0;
@@ -7728,14 +8439,7 @@ void runDynMiniApp(JsonDocument& doc) {
     btn[nb].y = b["y"] | 40;
     btn[nb].w = b["w"] | 30;
     btn[nb].h = b["h"] | 20;
-    
-    // Label: может быть строкой или числом
-    JsonVariant lv = b["label"];
-    if (lv.isNull()) btn[nb].label = "?";
-    else if (lv.is<const char*>()) btn[nb].label = String(lv.as<const char*>());
-    else btn[nb].label = String(lv.as<long>());
-    
-    // Action: строка
+    btn[nb].label = String((const char*)(b["label"] | "?"));
     String act = String((const char*)(b["act"] | "set"));
     btn[nb].action = 0;
     if (act == "add") btn[nb].action = 1;
@@ -7743,25 +8447,15 @@ void runDynMiniApp(JsonDocument& doc) {
     else if (act == "expr") btn[nb].action = 3;
     else if (act == "rand") btn[nb].action = 4;
     else if (act == "exit") btn[nb].action = 5;
-    
+    else if (act == "sys") btn[nb].action = 6;
     btn[nb].target = String((const char*)(b["var"] | ""));
-    
-    // ★ ГЛАВНЫЙ ФИКС ★
-    // val: может быть строкой ("5") или числом (5) — обрабатываем оба
-    JsonVariant v = b["val"];
-    if (v.isNull()) {
-      btn[nb].val = "0";
-    } else if (v.is<const char*>()) {
-      btn[nb].val = String(v.as<const char*>());
-    } else if (v.is<float>() && !v.is<long>()) {
-      btn[nb].val = String(v.as<float>(), 2);
-    } else {
-      btn[nb].val = String(v.as<long>());
-    }
-    
+    btn[nb].sysName = String((const char*)(b["sys"] | ""));
+    btn[nb].sysArg = String((const char*)(b["arg"] | ""));
+    btn[nb].val = String((const char*)(b["val"] | "0"));
     nb++;
   }
   
+  // Тикер
   String tickVar = doc["params"]["tick"]["var"] | "";
   int32_t tickBy = doc["params"]["tick"]["by"] | 0;
   String tickIf = doc["params"]["tick"]["if"] | "";
@@ -7792,6 +8486,7 @@ void runDynMiniApp(JsonDocument& doc) {
     pollButtons();
     if (quitPressed()) break;
     
+    // Тикер
     if (tickVar.length() && millis() - lastTick >= (uint32_t)tickMs) {
       lastTick = millis();
       bool shouldTick = true;
@@ -7805,9 +8500,11 @@ void runDynMiniApp(JsonDocument& doc) {
       }
     }
     
+    // Навигация
     if (nav(BI_LEFT)  && sel > 0)    sel--;
     if (nav(BI_RIGHT) && sel < nb - 1) sel++;
     
+    // Действие
     if (evDown[BI_OK] && nb > 0) {
       MBtn& b = btn[sel];
       int vi = findVar(b.target);
@@ -7824,21 +8521,81 @@ void runDynMiniApp(JsonDocument& doc) {
         vars[vi].value = random(0, mx > 0 ? mx : 1);
       }
       else if (b.action == 5) break;
-      SFX(SF_CLICK);
+      else if (b.action == 6) {
+        String sn = b.sysName; String sa = b.sysArg;
+        if (sn == "temp") vars[vi].value = (int32_t)temperatureRead();
+        else if (sn == "heap") vars[vi].value = ESP.getFreeHeap() / 1024;
+        else if (sn == "uptime") vars[vi].value = millis() / 1000;
+        else if (sn == "wifi_rssi") vars[vi].value = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0;
+        else if (sn == "wifi_ok") vars[vi].value = (WiFi.status() == WL_CONNECTED) ? 1 : 0;
+        else if (sn == "unix_time") vars[vi].value = (int32_t)time(nullptr);
+        else if (sn == "hour") { time_t t = time(nullptr); struct tm tm; if (localtime_r(&t, &tm)) vars[vi].value = tm.tm_hour; }
+        else if (sn == "min") { time_t t = time(nullptr); struct tm tm; if (localtime_r(&t, &tm)) vars[vi].value = tm.tm_min; }
+        else if (sn == "sec") { time_t t = time(nullptr); struct tm tm; if (localtime_r(&t, &tm)) vars[vi].value = tm.tm_sec; }
+        else if (sn == "day") { time_t t = time(nullptr); struct tm tm; if (localtime_r(&t, &tm)) vars[vi].value = tm.tm_mday; }
+        else if (sn == "mon") { time_t t = time(nullptr); struct tm tm; if (localtime_r(&t, &tm)) vars[vi].value = tm.tm_mon + 1; }
+        else if (sn == "year") { time_t t = time(nullptr); struct tm tm; if (localtime_r(&t, &tm)) vars[vi].value = tm.tm_year + 1900; }
+        else if (sn == "rtc_sync") { rtcPresent = rtcWriteTime(time(nullptr)); vars[vi].value = rtcPresent ? 1 : 0; }
+        else if (sn == "rtc_load") { bool ok = rtcSetSystemClock(); vars[vi].value = ok ? 1 : 0; }
+        else if (sn == "sd_ok") vars[vi].value = sdReady ? 1 : 0;
+        else if (sn == "sd_free") {
+          vars[vi].value = 0;
+          if (sdReady) {
+            uint64_t total = SD.totalBytes();
+            uint64_t used = SD.usedBytes();
+            vars[vi].value = (int32_t)((total - used) / 1024);
+          }
+        }
+        else if (sn == "nvs_get") vars[vi].value = prefs.getInt(sa.c_str(), 0);
+        else if (sn == "nvs_set") prefs.putInt(sa.c_str(), b.val.toInt());
+        else if (sn == "nvs_del") prefs.remove(sa.c_str());
+        else if (sn == "sd_write") {
+          if (sdReady && sa.length()) {
+            File f = SD.open(sa.c_str(), FILE_WRITE);
+            if (f) { f.print(b.val); f.close(); vars[vi].value = 1; }
+          }
+        }
+        else if (sn == "sd_append") {
+          if (sdReady && sa.length()) {
+            File f = SD.open(sa.c_str(), FILE_APPEND);
+            if (f) { f.println(b.val); f.close(); vars[vi].value = 1; }
+          }
+        }
+        else if (sn == "sd_read") {
+          vars[vi].value = 0;
+          if (sdReady && sa.length()) {
+            File f = SD.open(sa.c_str(), FILE_READ);
+            if (f) { String s; while (f.available() && s.length() < 32) s += (char)f.read(); f.close(); vars[vi].value = s.toInt(); }
+          }
+        }
+        else if (sn == "sd_delete") { if (sdReady && SD.exists(sa.c_str())) { SD.remove(sa.c_str()); vars[vi].value = 1; } }
+        else if (sn == "beep") {
+          int freq = b.val.toInt();
+          int dur = sa.toInt();
+          if (freq > 0) { toneHz(freq); delay(dur > 0 ? dur : 100); toneHz(0); }
+        }
+        else if (sn == "lang") vars[vi].value = cfg.lang;
+        else if (sn == "lang_count") vars[vi].value = cfg.langCount;
+        else if (sn == "battery_mv") vars[vi].value = 0;
+        else if (sn == "chip") vars[vi].value = ESP.getChipRevision();
+        else if (sn == "cpu_mhz") vars[vi].value = ESP.getCpuFreqMHz();
+        SFX(SF_CLICK);
+      }
     }
     
+    // Отрисовка
     oled.clearBuffer();
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
+    oled.setFont(uiFontSmall());
     if (title.length()) oled.drawUTF8(0, 8, title.c_str());
     oled.drawHLine(0, 11, 128);
     
     int vi = findVar(displayBind);
     String disp = (vi >= 0) ? String(vars[vi].value) : "--";
     oled.setFont(u8g2_font_9x15_tr);
-    int w = oled.getStrWidth(disp.c_str());
-    oled.drawStr(64 - w/2, 28, disp.c_str());
+    int w = oled.getUTF8Width(disp.c_str());
+    oled.drawUTF8(64 - w/2, 28, disp.c_str());
     
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
+    oled.setFont(uiFontSmall());
     for (int i = 0; i < nb; i++) {
       MBtn& b = btn[i];
       if (i == sel) {
@@ -7889,7 +8646,7 @@ void runDynText(JsonDocument& doc) {
     if (nav(BI_LEFT) && scrollLine >= 6) scrollLine -= 6;
     
     oled.clearBuffer();
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
+    oled.setFont(uiFontSmall());
     for (int i = 0; i < 7; i++) {
       int idx = scrollLine + i;
       if (idx >= n) break;
@@ -7956,8 +8713,8 @@ void runDynQuiz(JsonDocument& doc) {
     }
     
     oled.clearBuffer();
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
-    oled.drawStr(0, 8, (String(qi+1) + "/" + String(total) + "  S:" + String(score)).c_str());
+    oled.setFont(uiFontSmall());
+    oled.drawUTF8(0, 8, (String(qi+1) + "/" + String(total) + "  S:" + String(score)).c_str());
     oled.drawHLine(0, 10, 128);
     
     String q = qs[qi]["q"] | "?";
@@ -8060,13 +8817,13 @@ void runDynTodo(JsonDocument& doc) {
     }
     
     oled.clearBuffer();
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
-    oled.drawStr(0, 8, "TODO");
+    oled.setFont(uiFontSmall());
+    oled.drawUTF8(0, 8, "TODO");
     oled.drawHLine(0, 10, 128);
     
     if (n == 0) {
-      oled.drawStr(10, 32, "Empty");
-      oled.drawStr(10, 44, "hold OK to add");
+      oled.drawUTF8(10, 32, "Empty");
+      oled.drawUTF8(10, 44, "hold OK to add");
     } else {
       int start = max(0, sel - 2);
       for (int i = 0; i < 5 && start + i < n; i++) {
@@ -8081,7 +8838,7 @@ void runDynTodo(JsonDocument& doc) {
         if (idx == sel) oled.setDrawColor(1);
       }
     }
-    oled.drawStr(0, 63, "OK: toggle  hold: add");
+    oled.drawUTF8(0, 63, "OK: toggle  hold: add");
     present();
     frameWait(t0);
   }
@@ -8108,12 +8865,12 @@ void runDynGemini(JsonDocument& doc) {
   
     if (shouldSave) {
     oled.clearBuffer();
-    oled.setFont(u8g2_font_6x13_t_cyrillic);
-    oled.drawStr(0, 12, "Save answer?");
+    oled.setFont(uiFontLarge());
+    oled.drawUTF8(0, 12, "Save answer?");
     oled.drawHLine(0, 16, 128);
-    oled.setFont(u8g2_font_5x8_t_cyrillic);
-    oled.drawStr(4, 32, "OK: save as note");
-    oled.drawStr(4, 44, "BACK: discard");
+    oled.setFont(uiFontSmall());
+    oled.drawUTF8(4, 32, "OK: save as note");
+    oled.drawUTF8(4, 44, "BACK: discard");
     present();
     waitRelease();
     while (true) {
@@ -8132,188 +8889,6 @@ void runDynGemini(JsonDocument& doc) {
       present(); delay(20);
     }
   }
-}
-// ===== CHIP-8 EMULATOR =====
-namespace chip8 {
-  uint8_t mem[4096];
-  uint8_t V[16];
-  uint16_t I = 0;
-  uint16_t PC = 0x200;
-  uint16_t stack[16];
-  uint8_t SP = 0;
-  uint8_t DT = 0, ST = 0;
-  uint8_t gfx[64*32];
-  uint8_t keys[16];
-  uint16_t opcode;
-  bool waitingForKey = false;
-  uint8_t waitReg = 0;
-  uint32_t lastCycle = 0;
-  uint32_t lastTimer = 0;
-  
-  const uint8_t FONTSET[80] = {
-    0xF0,0x90,0x90,0x90,0xF0, 0x20,0x60,0x20,0x20,0x70,
-    0xF0,0x10,0xF0,0x80,0xF0, 0xF0,0x10,0xF0,0x10,0xF0,
-    0x90,0x90,0xF0,0x10,0x10, 0xF0,0x80,0xF0,0x10,0xF0,
-    0xF0,0x80,0xF0,0x90,0xF0, 0xF0,0x10,0x20,0x40,0x40,
-    0xF0,0x90,0xF0,0x90,0xF0, 0xF0,0x90,0xF0,0x10,0xF0,
-    0xF0,0x90,0xF0,0x90,0x90, 0xE0,0x90,0xE0,0x90,0xE0,
-    0xF0,0x80,0x80,0x80,0xF0, 0xE0,0x90,0x90,0x90,0xE0,
-    0xF0,0x80,0xF0,0x80,0xF0, 0xF0,0x80,0xF0,0x80,0x80
-  };
-  
-  void init() {
-    memset(mem, 0, 4096);
-    memset(V, 0, 16);
-    memset(gfx, 0, 64*32);
-    memset(stack, 0, sizeof(stack));
-    I = 0; PC = 0x200; SP = 0; DT = 0; ST = 0;
-    waitingForKey = false; waitReg = 0;
-    for (int i = 0; i < 80; i++) mem[i] = FONTSET[i];
-  }
-  
-  bool loadRom(const String& path) {
-    File f = SD.open(path);
-    if (!f || f.isDirectory()) { if (f) f.close(); return false; }
-    size_t sz = f.size();
-    if (sz > 3584) { f.close(); return false; }
-    f.read(&mem[0x200], sz);
-    f.close();
-    return true;
-  }
-  
-  void cycle() {
-    opcode = (mem[PC] << 8) | mem[PC+1];
-    PC += 2;
-    uint8_t x = (opcode >> 8) & 0x0F;
-    uint8_t y = (opcode >> 4) & 0x0F;
-    uint8_t n = opcode & 0x0F;
-    uint8_t nn = opcode & 0xFF;
-    uint16_t nnn = opcode & 0xFFF;
-    
-    switch (opcode & 0xF000) {
-      case 0x0000:
-        if (opcode == 0x00E0) memset(gfx, 0, 64*32);
-        else if (opcode == 0x00EE) PC = stack[--SP];
-        break;
-      case 0x1000: PC = nnn; break;
-      case 0x2000: stack[SP++] = PC; PC = nnn; break;
-      case 0x3000: if (V[x] == nn) PC += 2; break;
-      case 0x4000: if (V[x] != nn) PC += 2; break;
-      case 0x5000: if (V[x] == V[y]) PC += 2; break;
-      case 0x6000: V[x] = nn; break;
-      case 0x7000: V[x] += nn; break;
-      case 0x8000:
-        switch (n) {
-          case 0x0: V[x] = V[y]; break;
-          case 0x1: V[x] |= V[y]; break;
-          case 0x2: V[x] &= V[y]; break;
-          case 0x3: V[x] ^= V[y]; break;
-          case 0x4: { uint16_t s = V[x] + V[y]; V[0xF] = (s > 255) ? 1 : 0; V[x] = s & 0xFF; } break;
-          case 0x5: V[0xF] = (V[x] >= V[y]) ? 1 : 0; V[x] -= V[y]; break;
-          case 0x6: V[0xF] = V[x] & 1; V[x] >>= 1; break;
-          case 0x7: V[0xF] = (V[y] >= V[x]) ? 1 : 0; V[x] = V[y] - V[x]; break;
-          case 0xE: V[0xF] = (V[x] >> 7) & 1; V[x] <<= 1; break;
-        }
-        break;
-      case 0x9000: if (V[x] != V[y]) PC += 2; break;
-      case 0xA000: I = nnn; break;
-      case 0xB000: PC = nnn + V[0]; break;
-      case 0xC000: V[x] = random(256) & nn; break;
-      case 0xD000: {
-        uint16_t vx = V[x] % 64, vy = V[y] % 32;
-        V[0xF] = 0;
-        for (int row = 0; row < n; row++) {
-          uint8_t spr = mem[I + row];
-          for (int col = 0; col < 8; col++) {
-            if ((spr & (0x80 >> col)) != 0) {
-              int px = (vx + col) % 64;
-              int py = (vy + row) % 32;
-              int idx = py * 64 + px;
-              if (gfx[idx]) V[0xF] = 1;
-              gfx[idx] ^= 1;
-            }
-          }
-        }
-      } break;
-      case 0xE000:
-        if (nn == 0x9E) { if (keys[V[x] & 0xF]) PC += 2; }
-        else if (nn == 0xA1) { if (!keys[V[x] & 0xF]) PC += 2; }
-        break;
-      case 0xF000:
-        switch (nn) {
-          case 0x07: V[x] = DT; break;
-          case 0x0A: waitingForKey = true; waitReg = x; break;
-          case 0x15: DT = V[x]; break;
-          case 0x18: ST = V[x]; break;
-          case 0x1E: I += V[x]; break;
-          case 0x29: I = (V[x] & 0xF) * 5; break;
-          case 0x33: mem[I] = V[x]/100; mem[I+1] = (V[x]/10)%10; mem[I+2] = V[x]%10; break;
-          case 0x55: for (int i=0; i<=x; i++) mem[I+i] = V[i]; break;
-          case 0x65: for (int i=0; i<=x; i++) V[i] = mem[I+i]; break;
-        }
-        break;
-    }
-  }
-  
-  void render() {
-    oled.clearBuffer();
-    for (int y = 0; y < 32; y++)
-      for (int x = 0; x < 64; x++)
-        if (gfx[y*64 + x]) oled.drawBox(x*2, y*2, 2, 2);
-    oled.sendBuffer();
-  }
-  
-  void run(const String& romPath) {
-    init();
-    if (!loadRom(romPath)) {
-      showScreen("CHIP-8", "ROM not found", romPath.c_str());
-      waitAnyKey();
-      return;
-    }
-    waitRelease();
-    playMusicTheme(TECH_MENU, OLD_MENU, CHILL_MENU, DARK_MENU, TECH_MENU, 160);
-    lastCycle = lastTimer = millis();
-    
-    while (true) {
-      pollButtons();
-      if (evLong[BI_BACK]) return;
-      
-      memset(keys, 0, 16);
-      if (held(BI_UP))    keys[2] = 1;
-      if (held(BI_DOWN))  keys[8] = 1;
-      if (held(BI_LEFT))  keys[4] = 1;
-      if (held(BI_RIGHT)) keys[6] = 1;
-      if (held(BI_OK))    keys[5] = 1;
-      
-      if (waitingForKey) {
-        for (int k = 0; k < 16; k++) {
-          if (keys[k]) { V[waitReg] = k; waitingForKey = false; break; }
-        }
-        render();
-        frameWait(millis());
-        continue;
-      }
-      
-      uint32_t now = millis();
-      while (now - lastCycle >= 2) {
-        cycle();
-        lastCycle += 2;
-      }
-      if (now - lastTimer >= 16) {
-        lastTimer = now;
-        if (DT > 0) DT--;
-        if (ST > 0) { ST--; SFX(SF_CLICK); }
-      }
-      render();
-      frameWait(millis());
-    }
-  }
-}
-
-void runDynChip8(JsonDocument& doc) {
-  String rom = doc["params"]["rom"] | "";
-  if (!rom.length()) { showScreen("CHIP-8", "No rom in config", ""); waitAnyKey(); return; }
-  chip8::run(rom);
 }
 void runDynamicApp(int idx) {
   waitRelease();
@@ -8346,7 +8921,6 @@ void runDynamicApp(int idx) {
   else if (engine == "quiz") runDynQuiz(doc);
   else if (engine == "todo") runDynTodo(doc);
   else if (engine == "gemini") runDynGemini(doc);
-  else if (engine == "chip8") runDynChip8(doc);
   else {
     showScreen("Unknown engine", engine.c_str(), "Supported:", "snake/runner/flappy/breakout/maze/jumper/invaders/pong");
     waitAnyKey();
@@ -8415,7 +8989,7 @@ void runMenu() {
 
     // Short press on physical button 6 cycles language; hold exits menu.
     if (evTap[BI_BACK]) {
-      cfg.lang = (cfg.lang + 1) % 3;
+      cfg.lang = (cfg.lang + 1) % max((uint8_t)1, cfg.langCount);
       saveCfg();
       if (cfg.sfx) SFX(SF_CLICK);
     }
@@ -8442,10 +9016,10 @@ bool okDown = bst[BI_OK].stable; // Теперь учитывается и фи�
     if (okDown && !okLongFired && (millis() - okDownAt > 2500)) {
       okLongFired = true;
       bst[BI_OK].longDone = true; // подавить evTap
-      if (menuSel == APP_FILE_MANAGER) { showScreen("File Manager", "OK: open", "Phone: MINI-BOY-FILES", "192.168.4.1"); waitAnyKey(); } else showGameDocs(menuSel);
+      if (menuSel == APP_FILE_MANAGER) { showScreen("File Manager", "OK: open", "Phone: MINI-BOY-FILES", "192.168.4.1"); waitAnyKey(); } else showGameDocs((menuSel <= APP_COUNT) ? appOrder[menuSel] : (DYNAMIC_APP_ID_BASE + (menuSel - APP_COUNT - 1)));
     }
     if (joyOkTapEvent || (!okDown && okWasDown && !okLongFired)) {
-      launchApp(menuSel);
+      launchApp((menuSel <= APP_COUNT) ? appOrder[menuSel] : (DYNAMIC_APP_ID_BASE + (menuSel - APP_COUNT - 1)));
       waitRelease();
       // После игры пользователь может всё ещё держать OK — избегаем повторного запуска
       okWasDown = false;
@@ -8488,8 +9062,8 @@ void showBoot() {
     float k = min(1.0f, f/20.0f);
     drawSparkle(64, 26, 3+(int)(k*10));
     if (f>20) {
-      oled.setFont(u8g2_font_6x13_t_cyrillic);
-      oled.drawStr(64-oled.getStrWidth("MINI BOY v5.1")/2, 56, "MINI BOY v5.1");
+      oled.setFont(uiFontLarge());
+      oled.drawUTF8(64-oled.getUTF8Width("MINI BOY v5.1")/2, 56, "MINI BOY v5.1");
     }
     present();
     frameWait(t0);
@@ -8498,7 +9072,7 @@ void showBoot() {
 }
 
 void calibrateJoystickWizard(bool force) {
-  if (!joystickEnabled) { oled.clearBuffer(); oled.setFont(u8g2_font_6x13_t_cyrillic); oled.drawStr(8,24,"Enable joystick first"); present(); delay(900); return; }
+  if (!joystickEnabled) { oled.clearBuffer(); oled.setFont(uiFontLarge()); oled.drawUTF8(8,24,"Enable joystick first"); present(); delay(900); return; }
   bool done = prefs.getBool("joycal_v2", false);
   if (done && !force) return;
 
@@ -8506,18 +9080,18 @@ void calibrateJoystickWizard(bool force) {
   int oldMinX=joyMinX, oldMaxX=joyMaxX, oldMinY=joyMinY, oldMaxY=joyMaxY;
   
   oled.clearBuffer();
-  oled.setFont(u8g2_font_6x13_t_cyrillic);
-  oled.drawStr(8,13,"KALIBRUVANNIA");
+  oled.setFont(uiFontLarge());
+  oled.drawUTF8(8,13,"KALIBRUVANNIA");
   oled.drawHLine(0,17,128);
-  oled.setFont(u8g2_font_5x8_t_cyrillic);
-  oled.drawStr(5,29,"1. Ne chypai rucku");
-  oled.drawStr(5,39,"Zalysh po centru 3 sek");
+  oled.setFont(uiFontSmall());
+  oled.drawUTF8(5,29,"1. Ne chypai rucku");
+  oled.drawUTF8(5,39,"Zalysh po centru 3 sek");
   
   for (int f=0; f<36; ++f) {
     uint32_t t0=millis();
     oled.setDrawColor(0); oled.drawBox(8,47,112,10); oled.setDrawColor(1);
     oled.drawFrame(8,48,112,8); oled.drawBox(10,50,(f*108)/35,4);
-    oled.drawStr(19,63,"Ne rukhai dzhoystyk"); present(); frameWait(t0);
+    oled.drawUTF8(19,63,"Ne rukhai dzhoystyk"); present(); frameWait(t0);
   }
   
   long sx=0, sy=0; int minCenterX=4095, maxCenterX=0, minCenterY=4095, maxCenterY=0;
@@ -8530,13 +9104,13 @@ void calibrateJoystickWizard(bool force) {
   bool centerStable=(maxCenterX-minCenterX)<260 && (maxCenterY-minCenterY)<260;
   
   if(!(cx>250 && cx<3845 && cy>250 && cy<3845 && centerStable)) {
-    oled.clearBuffer(); oled.setFont(u8g2_font_6x13_t_cyrillic); oled.drawStr(8,22,"CENTER ERROR");
-    oled.setFont(u8g2_font_5x8_t_cyrillic); oled.drawStr(5,36,"Stick moved or signal noisy"); oled.drawStr(5,48,"Check wires, then reboot"); present(); delay(1800); return;
+    oled.clearBuffer(); oled.setFont(uiFontLarge()); oled.drawUTF8(8,22,"CENTER ERROR");
+    oled.setFont(uiFontSmall()); oled.drawUTF8(5,36,"Stick moved or signal noisy"); oled.drawUTF8(5,48,"Check wires, then reboot"); present(); delay(1800); return;
   }
 
   int newMinX=4095, newMaxX=0, newMinY=4095, newMaxY=0;
-  oled.clearBuffer(); oled.setFont(u8g2_font_6x13_t_cyrillic); oled.drawStr(8,13,"RUHAY DZHОYSTYK"); oled.drawHLine(0,17,128);
-  oled.setFont(u8g2_font_5x8_t_cyrillic); oled.drawStr(5,29,"2. Povilno do vsikh kraiv"); oled.drawStr(5,39,"Livo, pravo, vhoru, vnyz");
+  oled.clearBuffer(); oled.setFont(uiFontLarge()); oled.drawUTF8(8,13,"RUHAY DZHОYSTYK"); oled.drawHLine(0,17,128);
+  oled.setFont(uiFontSmall()); oled.drawUTF8(5,29,"2. Povilno do vsikh kraiv"); oled.drawUTF8(5,39,"Livo, pravo, vhoru, vnyz");
   oled.drawCircle(64,51,9); oled.drawCircle(64,51,15); oled.drawDisc(64,51,2); present();
   
   uint32_t start=millis(), lastDraw=0;
@@ -8544,18 +9118,18 @@ void calibrateJoystickWizard(bool force) {
     int x=analogRead(JOY_X_PIN), y=analogRead(JOY_Y_PIN);
     newMinX=min(newMinX,x); newMaxX=max(newMaxX,x); newMinY=min(newMinY,y); newMaxY=max(newMaxY,y);
     if(millis()-lastDraw>100){ 
-      lastDraw=millis(); oled.clearBuffer(); oled.setFont(u8g2_font_6x13_t_cyrillic); oled.drawStr(8,13,"RUHAY DZHОYSTYK"); oled.drawHLine(0,17,128); 
-      oled.setFont(u8g2_font_5x8_t_cyrillic); oled.drawStr(5,28,"Circle the outer limits"); oled.drawFrame(10,34,108,8); 
+      lastDraw=millis(); oled.clearBuffer(); oled.setFont(uiFontLarge()); oled.drawUTF8(8,13,"RUHAY DZHОYSTYK"); oled.drawHLine(0,17,128); 
+      oled.setFont(uiFontSmall()); oled.drawUTF8(5,28,"Circle the outer limits"); oled.drawFrame(10,34,108,8); 
       int pct=(millis()-start)*104/7000; oled.drawBox(12,36,pct,4); 
-      oled.drawStr(5,53,(String("X ")+newMinX+".."+newMaxX).c_str()); oled.drawStr(5,63,(String("Y ")+newMinY+".."+newMaxY).c_str()); present(); 
+      oled.drawUTF8(5,53,(String("X ")+newMinX+".."+newMaxX).c_str()); oled.drawUTF8(5,63,(String("Y ")+newMinY+".."+newMaxY).c_str()); present(); 
     }
     delay(8);
   }
   
   bool validX=(newMaxX-newMinX)>1200, validY=(newMaxY-newMinY)>1200;
   if(!validX || !validY) {
-    oled.clearBuffer(); oled.setFont(u8g2_font_6x13_t_cyrillic); oled.drawStr(8,22,"NE ZBERIHALOS");
-    oled.setFont(u8g2_font_5x8_t_cyrillic); oled.drawStr(5,36,"Move stick to all 4 edges"); oled.drawStr(5,48,"Calibration NOT saved"); present(); delay(1800);
+    oled.clearBuffer(); oled.setFont(uiFontLarge()); oled.drawUTF8(8,22,"NE ZBERIHALOS");
+    oled.setFont(uiFontSmall()); oled.drawUTF8(5,36,"Move stick to all 4 edges"); oled.drawUTF8(5,48,"Calibration NOT saved"); present(); delay(1800);
     joyCenterX=oldCx; joyCenterY=oldCy; joyMinX=oldMinX; joyMaxX=oldMaxX; joyMinY=oldMinY; joyMaxY=oldMaxY;
     joyFilteredX=joyCenterX; joyFilteredY=joyCenterY; return;
   }
@@ -8570,10 +9144,10 @@ void calibrateJoystickWizard(bool force) {
   prefs.putInt("jminy",joyMinY); prefs.putInt("jmaxy",joyMaxY); 
   prefs.putBool("joycal",true); prefs.putBool("joycal_v2",true);
   
-  oled.clearBuffer(); oled.setFont(u8g2_font_6x13_t_cyrillic); oled.drawStr(25,19,"ZBEREZHENO!"); 
-  oled.setFont(u8g2_font_5x8_t_cyrillic); oled.drawStr(6,32,"Kalibrovku zberezheno"); 
-  oled.drawStr(6,43,(String("Center: ")+joyCenterX+","+joyCenterY).c_str()); 
-  oled.drawStr(6,54,"Natysny fizychnu knopku"); oled.drawStr(6,63,"shchob prodovzhyty"); present();
+  oled.clearBuffer(); oled.setFont(uiFontLarge()); oled.drawUTF8(25,19,"ZBEREZHENO!"); 
+  oled.setFont(uiFontSmall()); oled.drawUTF8(6,32,"Kalibrovku zberezheno"); 
+  oled.drawUTF8(6,43,(String("Center: ")+joyCenterX+","+joyCenterY).c_str()); 
+  oled.drawUTF8(6,54,"Natysny fizychnu knopku"); oled.drawUTF8(6,63,"shchob prodovzhyty"); present();
   delay(1800);
 }
 
@@ -8588,11 +9162,11 @@ void showFileManagerSplash() {
   oled.drawFrame(26, 26, 13, 13); oled.drawVLine(30, 28, 9); oled.drawVLine(34, 28, 9);
   oled.drawFrame(72, 14, 22, 31); oled.drawHLine(77, 19, 12); oled.drawHLine(77, 23, 12);
   oled.drawHLine(77, 27, 8); oled.drawBox(79, 35, 8, 5);
-  oled.setFont(u8g2_font_6x13_t_cyrillic); oled.drawStr(47, 17, "MINI-BOY");
-  oled.setFont(u8g2_font_5x8_t_cyrillic); oled.drawStr(47, 29, "FILE MANAGER");
-  oled.drawStr(47, 40, "SD SERVICE");
+  oled.setFont(uiFontLarge()); oled.drawUTF8(47, 17, "MINI-BOY");
+  oled.setFont(uiFontSmall()); oled.drawUTF8(47, 29, "FILE MANAGER");
+  oled.drawUTF8(47, 40, "SD SERVICE");
   oled.drawHLine(14, 49, 100);
-  oled.setFont(u8g2_font_5x8_t_cyrillic); oled.drawStr(14, 57, "192.168.4.1");
+  oled.setFont(uiFontSmall()); oled.drawUTF8(14, 57, "192.168.4.1");
   present();
 }
 void scanMbApps() {
@@ -8657,6 +9231,25 @@ void scanMbApps() {
   menuAppCount = APP_COUNT + 1 + mbAppCount;
 }
 
+void heartbeatTask(void* pv) {
+  
+  vTaskDelay(pdMS_TO_TICKS(3000));
+  while (true) {
+    sendHeartbeat();
+    vTaskDelay(pdMS_TO_TICKS(20000));
+  }
+}
+
+void testFonts() {
+  oled.clearBuffer();
+  oled.setFont(u8g2_font_6x10_tf); oled.drawUTF8(0, 10, "6x10_tf: aouAOU");
+  oled.setFont(u8g2_font_6x12_tf); oled.drawUTF8(0, 24, "6x12_tf: aouAOU");
+  oled.setFont(u8g2_font_unifont_t_cyrillic); oled.drawUTF8(0, 40, "unifont: aouAOU");
+  oled.setFont(u8g2_font_helvB08_tf); oled.drawUTF8(0, 56, "helvB08_tf: aouAOU");
+  oled.sendBuffer();
+  delay(8000);
+}
+
 void setup() {
 #if ENABLE_SERIAL
   Serial.begin(115200);
@@ -8674,6 +9267,7 @@ void setup() {
   randomSeed(micros());
   prefs.begin("miniboy", false);
   setenv("TZ","CET-1CEST,M3.5.0/2,M10.5.0/3",1); tzset();
+  for (int i = 0; i <= APP_COUNT; i++) appOrder[i] = i;
   loadCfg();
   loadButtonGpio();
   bootLogoFromSD = prefs.getBool("bootlogo_sd", false);
@@ -8699,7 +9293,13 @@ void setup() {
   if (cfg.autoConn && ssid.length()) WiFi.begin(ssid.c_str(), pass.c_str());
   setupFileWeb();
  scanMbApps(); 
+  startHeartbeatTask();
+  scanLoadedLangs();
   showBoot();
+  if (g_pinEnabled && g_pinCode.length() > 0) { runLockScreen();
+    for (int i = 0; i < BI_COUNT; i++) { evDown[i] = evTap[i] = evRep[i] = evLong[i] = false; }
+    waitRelease();
+  }
   // Joystick removed; do not run joystick calibration wizard.
   playMusicTheme(TECH_MENU,OLD_MENU,CHILL_MENU,DARK_MENU,TECH_MENU,150);
 }
@@ -8764,4 +9364,4 @@ void loop() {
  * Future game-specific settings should use the same pattern: define a bounded
  * default, load it from Preferences, expose it in runAppOptions(), persist it,
  * and read it inside the relevant game. Av oid adding unused menu labels.
- */
+ */ 

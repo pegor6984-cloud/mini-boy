@@ -23,7 +23,7 @@ struct Settings {
   uint8_t bright=2; bool invert=false, showPass=false; uint8_t layout=0, rep=1;
   bool showFps=false, autoConn=true, sfx=true; uint8_t musicTheme=THEME_TECH, volPercent=50;
   uint8_t difficulty=1, animSpeed=1; bool showClock=true, clock24h=true, autoTime=true; uint8_t lang=0;
-  bool showFileTypes=true, settingsWrap=true;
+  bool showFileTypes=true, settingsWrap=true; uint8_t langCount=3;
   // === КАЛИБРОВКА КНОПОК (сохраняем какой GPIO соответствует какой кнопке) ===
   uint8_t btnGpioUp=5, btnGpioDown=7, btnGpioLeft=3, btnGpioRight=1, btnGpioOk=2, btnGpioBack=6;
 };
